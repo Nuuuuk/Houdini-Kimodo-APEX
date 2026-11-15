@@ -93,6 +93,7 @@ class _GenerateJob:
             if health["status"] != "ready":
                 self.status(f"Loading models... ({elapsed:.0f} s)")
                 return False
+            self.client.register_session()
             self.job_id = self.client.generate(self.request)
         if self.canceled:
             self.client.cancel(self.job_id)
@@ -111,24 +112,37 @@ class _GenerateJob:
 
 def generate(node, wait=False, poll=0.25, timeout=600.0):
     """start generating, returns the job or None"""
-    if node.sessionId() in _running:
+    sid = node.sessionId()
+    if sid in _running:
         set_status(node, "Already generating.")
-        return
+        return None
     try:
         gen = _GenerateJob(node)
     except (hou.Error, doc.DocError, client.ServiceError) as e:
         set_status(node, f"Cannot generate: {e}")
-        return
+        return None
+    _running[sid] = gen
+    set_busy(node, True)
+
+    def finished():
+        _running.pop(sid, None)
+        try:
+            set_busy(node, False)
+        except hou.ObjectWasDeleted:
+            pass
+
     if wait or not hou.isUIAvailable():
         deadline = time.monotonic() + timeout
-        while not _safe_step(gen):
-            if time.monotonic() > deadline:
-                gen.status("Timed out waiting for the service.")
-                break
-            time.sleep(poll)
-        return
+        try:
+            while not _safe_step(gen):
+                if time.monotonic() > deadline:
+                    gen.status("Timed out waiting for the service.")
+                    break
+                time.sleep(poll)
+        finally:
+            finished()
+        return gen
 
-    _running[node.sessionId()] = gen
     last = [0.0]
 
     def tick():
@@ -141,9 +155,15 @@ def generate(node, wait=False, poll=0.25, timeout=600.0):
             done = True
         if done:
             hou.ui.removeEventLoopCallback(tick)
-            _running.pop(node.sessionId(), None)
+            finished()
 
     hou.ui.addEventLoopCallback(tick)
+    return gen
+
+
+def set_busy(node, busy):
+    with hou.undos.disabler():
+        node.parm("busy").set(int(busy))
 
 
 def _safe_step(gen):
@@ -158,9 +178,11 @@ def cancel(node):
     """returns right away, the job stops at the next denoising step"""
     gen = _running.get(node.sessionId())
     if gen is None:
+        set_busy(node, False)
         set_status(node, "Nothing to cancel.")
     else:
         gen.canceled = True
+        gen.status("Canceling...")
 
 
 def _motion(path):

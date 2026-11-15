@@ -1,5 +1,6 @@
 """talks to the kimodo service over http, stdlib only."""
 
+import atexit
 import hashlib
 import json
 import os
@@ -8,13 +9,20 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import uuid
 
 HOST = "127.0.0.1"
 PORT = 8765
+SESSION_ID = uuid.uuid4().hex
+_registered = set()
 
 
 class ServiceError(RuntimeError):
     pass
+
+
+def text_encoder_device():
+    return os.environ.get("KIMODO_TEXT_ENCODER_DEVICE", "cuda")
 
 
 def make_request(doc, constraints_json):
@@ -31,6 +39,7 @@ def make_request(doc, constraints_json):
         "num_samples": g["num_samples"],
         "postprocess": g["postprocess"],
         "root_margin": g["root_margin"],
+        "text_encoder_device": text_encoder_device(),
     }
 
 
@@ -76,6 +85,20 @@ class Client:
 
     def shutdown(self):
         return self._request("POST", "/shutdown", {})
+
+    def register_session(self):
+        if self.base in _registered:
+            return
+        self._request("POST", "/clients/register", {"id": SESSION_ID, "pid": os.getpid()})
+        _registered.add(self.base)
+        atexit.register(self._unregister_quietly)
+
+    def _unregister_quietly(self):
+        self.timeout = 2.0
+        try:
+            self._request("POST", "/clients/unregister", {"id": SESSION_ID})
+        except Exception:
+            pass
 
     def ensure_running(self, timeout=300.0, poll=1.0, on_wait=None):
         """start the service if needed and wait until it's ready"""
