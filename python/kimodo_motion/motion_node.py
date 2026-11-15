@@ -9,6 +9,8 @@ from . import client, constraints, doc, skeleton
 
 CACHE_DIR = "$HIP/kimodo"
 _running = {}
+_status = {}
+ACTIVE_STAGES = ("starting", "loading", "generating", "canceling")
 _motions = {}
 
 
@@ -20,9 +22,51 @@ def write_doc(node, d):
     node.parm("kimodo_doc").set(doc.dumps(d))
 
 
-def set_status(node, text):
+def set_status(node, text, stage="idle", progress=None, started=None, detail=""):
+    sid = node.sessionId()
+    previous = _status.get(sid, {}).get("stage")
+    elapsed = None if started is None or stage in ACTIVE_STAGES else time.monotonic() - started
+    _status[sid] = {
+        "stage": stage,
+        "text": text,
+        "progress": progress,
+        "started": started,
+        "elapsed": elapsed,
+        "detail": detail,
+        "log": client.log_path() if stage == "error" else "",
+    }
     with hou.undos.disabler():
         node.parm("status").set(text)
+        if stage == "error":
+            node.parm("error").set(text if not detail else f"{text}\n{detail}")
+    if stage != previous and hou.isUIAvailable():
+        severity = hou.severityType.Error if stage == "error" else hou.severityType.Message
+        hou.ui.setStatusMessage(f"Kimodo Motion ({node.name()}): {text}", severity)
+
+
+def get_status(node):
+    """after a hip load only the saved text and error are known"""
+    st = _status.get(node.sessionId())
+    if st is None:
+        error = node.parm("error").unexpandedString()
+        st = {
+            "stage": "error" if error else "idle",
+            "text": error.split("\n", 1)[0] or node.evalParm("status"),
+            "progress": None,
+            "started": None,
+            "elapsed": None,
+            "detail": error.partition("\n")[2],
+            "log": client.log_path() if error else "",
+        }
+    return st
+
+
+def clear_error(node):
+    had_error = bool(node.parm("error").unexpandedString())
+    with hou.undos.disabler():
+        node.parm("error").set("")
+    if had_error:
+        set_status(node, "Error dismissed.")
 
 
 def doc_from_parms(node):
@@ -63,13 +107,16 @@ class _GenerateJob:
         self.job_id, self.started, self.canceled, self.proc = None, time.monotonic(), False, None
         self.warning = "" if abs(hou.fps() - doc.FPS) < 1e-6 else f"Scene is {hou.fps():g} fps, Kimodo is 30 fps. "
 
-    def status(self, text):
-        set_status(self.node, self.warning + text)
+    def status(self, text, stage, progress=None, detail=""):
+        set_status(self.node, self.warning + text, stage, progress, self.started, detail)
+
+    def fail(self, text, detail=""):
+        self.status(text, "error", detail=detail or f"See {client.log_path()}")
 
     def finish(self, text):
         self.doc["result"] = {"npz": self.paths, "selected": min(self.node.evalParm("sample"), len(self.paths) - 1)}
         write_doc(self.node, self.doc)
-        self.status(text)
+        self.status(text, "done")
 
     def step(self):
         elapsed = time.monotonic() - self.started
@@ -78,20 +125,20 @@ class _GenerateJob:
                 self.finish("Loaded cached result.")
                 return True
             if self.canceled:
-                self.status("Canceled.")
+                self.status("Canceled.", "canceled")
                 return True
             health = self.client.health()
             if health is None:
                 if self.proc is None:
                     self.proc = client.start_service()
                 client.check_exited(self.proc)
-                self.status(f"Starting the Kimodo service... ({elapsed:.0f} s)")
+                self.status(f"Starting the Kimodo service... ({elapsed:.0f} s)", "starting")
                 return False
             if health["status"] == "error":
-                self.status(f"Service failed to load: {health['error']} (see {client.log_path()})")
+                self.fail("The Kimodo service failed to load its models.", health["error"])
                 return True
             if health["status"] != "ready":
-                self.status(f"Loading models... ({elapsed:.0f} s)")
+                self.status(f"Loading models... ({elapsed:.0f} s)", "loading")
                 return False
             self.client.register_session()
             self.job_id = self.client.generate(self.request)
@@ -99,14 +146,15 @@ class _GenerateJob:
             self.client.cancel(self.job_id)
         job = self.client.job(self.job_id)
         if job["status"] in ("queued", "running"):
-            self.status(f"Generating... {job['progress'] * 100:.0f}%")
+            stage = "canceling" if self.canceled else "generating"
+            self.status(f"Generating... {job['progress'] * 100:.0f}%", stage, job["progress"])
             return False
         if job["status"] == "done":
             self.finish(f"Done in {elapsed:.1f} s.")
         elif job["status"] == "canceled":
-            self.status("Canceled.")
+            self.status("Canceled.", "canceled")
         else:
-            self.status(f"Generation failed: {job['error']}")
+            self.fail("Generation failed.", job["error"])
         return True
 
 
@@ -116,12 +164,16 @@ def generate(node, wait=False, poll=0.25, timeout=600.0):
     if sid in _running:
         set_status(node, "Already generating.")
         return None
+    clear_error(node)
     try:
         gen = _GenerateJob(node)
     except (hou.Error, doc.DocError, client.ServiceError) as e:
-        set_status(node, f"Cannot generate: {e}")
+        message = e.instanceMessage() if isinstance(e, hou.Error) else str(e)
+        set_status(node, "Cannot generate.", "error", detail=message)
         return None
     _running[sid] = gen
+    if gen.warning and hou.isUIAvailable():
+        hou.ui.setStatusMessage(f"Kimodo Motion ({node.name()}): {gen.warning.strip()}", hou.severityType.Warning)
     set_busy(node, True)
 
     def finished():
@@ -136,7 +188,7 @@ def generate(node, wait=False, poll=0.25, timeout=600.0):
         try:
             while not _safe_step(gen):
                 if time.monotonic() > deadline:
-                    gen.status("Timed out waiting for the service.")
+                    gen.fail("Timed out waiting for the Kimodo service.")
                     break
                 time.sleep(poll)
         finally:
@@ -170,7 +222,7 @@ def _safe_step(gen):
     try:
         return gen.step()
     except (client.ServiceError, OSError) as e:
-        gen.status(f"Service error: {e}")
+        gen.fail("Kimodo service error.", str(e))
         return True
 
 
@@ -182,7 +234,7 @@ def cancel(node):
         set_status(node, "Nothing to cancel.")
     else:
         gen.canceled = True
-        gen.status("Canceling...")
+        gen.status("Canceling...", "canceling")
 
 
 def _motion(path):
@@ -201,9 +253,17 @@ def cook(sop):
     d = read_doc(node)
     paths = d["result"]["npz"]
     if not paths:
-        return
+        return raise_node_error(sop)
     sample = min(max(node.evalParm("sample"), 0), len(paths) - 1)
     path = hou.text.expandString(paths[sample])
     if not os.path.isfile(path):
         raise hou.NodeWarning(f"Result file is missing: {path}. Press Generate to recreate it.")
     skeleton.build_geometry(geo, _motion(path), int(round(frame)) - 1)
+    raise_node_error(sop)
+
+
+def raise_node_error(sop):
+    """last step of the cook, a failed generate shows as a node error"""
+    error = sop.parent().parm("error").unexpandedString()
+    if error:
+        raise hou.NodeError(error)
