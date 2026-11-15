@@ -1,0 +1,8 @@
+.venv/
+.deps/
+models/
+__pycache__/
+*.pyc
+*.npz
+*.bvh
+service.log
