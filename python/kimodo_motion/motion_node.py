@@ -221,6 +221,9 @@ def set_busy(node, busy):
 def _safe_step(gen):
     try:
         return gen.step()
+    except client.PortInUseError as e:
+        gen.fail(str(e), f"{gen.client.base}/health did not answer as the Kimodo service.")
+        return True
     except (client.ServiceError, OSError) as e:
         gen.fail("Kimodo service error.", str(e))
         return True
@@ -251,19 +254,15 @@ def cook(sop):
     geo = sop.geometry()
     frame = hou.frame()
     d = read_doc(node)
+    error = node.parm("error").unexpandedString()
     paths = d["result"]["npz"]
-    if not paths:
-        return raise_node_error(sop)
-    sample = min(max(node.evalParm("sample"), 0), len(paths) - 1)
-    path = hou.text.expandString(paths[sample])
+    path = hou.text.expandString(paths[min(max(node.evalParm("sample"), 0), len(paths) - 1)]) if paths else ""
     if not os.path.isfile(path):
-        raise hou.NodeWarning(f"Result file is missing: {path}. Press Generate to recreate it.")
+        if error:
+            raise hou.NodeError(error)
+        if path:
+            raise hou.NodeWarning(f"Result file is missing: {path}. Press Generate to recreate it.")
+        return
     skeleton.build_geometry(geo, _motion(path), int(round(frame)) - 1)
-    raise_node_error(sop)
-
-
-def raise_node_error(sop):
-    """last step of the cook, a failed generate shows as a node error"""
-    error = sop.parent().parm("error").unexpandedString()
     if error:
-        raise hou.NodeError(error)
+        raise hou.NodeWarning(f"The last Generate failed; this is the previous result.\n{error}")

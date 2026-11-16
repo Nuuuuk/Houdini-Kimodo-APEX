@@ -170,7 +170,7 @@ class StatusWidget(QtWidgets.QFrame):
         self.log_link = QtWidgets.QLabel()
         self.log_link.setOpenExternalLinks(True)
         dismiss = QtWidgets.QPushButton("Dismiss")
-        dismiss.setToolTip("Clear the node error. The previous result shows again.")
+        dismiss.setToolTip("Clear the warning or error on the node.")
         dismiss.clicked.connect(self.dismissed)
         actions.addWidget(self.log_link, 1)
         actions.addWidget(dismiss, 0)

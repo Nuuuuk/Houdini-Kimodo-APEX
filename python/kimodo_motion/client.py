@@ -2,6 +2,7 @@
 
 import atexit
 import hashlib
+import http.client
 import json
 import os
 import subprocess
@@ -13,12 +14,27 @@ import uuid
 
 HOST = "127.0.0.1"
 PORT = 44372
+SERVICE_NAME = "kimodo_motion"
+SERVICE_VERSION = 1
 SESSION_ID = uuid.uuid4().hex
 _registered = set()
 
 
 class ServiceError(RuntimeError):
     pass
+
+
+class PortInUseError(ServiceError):
+    pass
+
+
+def service_port():
+    value = os.environ.get("KIMODO_SERVICE_PORT", "").strip()
+    if not value:
+        return PORT
+    if not value.isdigit() or not 0 < int(value) < 65536:
+        raise ServiceError(f"KIMODO_SERVICE_PORT must be a port number (1-65535), got {value!r}")
+    return int(value)
 
 
 def text_encoder_device():
@@ -51,8 +67,9 @@ def cache_key(request):
 
 
 class Client:
-    def __init__(self, host=HOST, port=PORT, timeout=10.0):
-        self.base = f"http://{host}:{port}"
+    def __init__(self, host=HOST, port=None, timeout=10.0):
+        self.port = port or service_port()
+        self.base = f"http://{host}:{self.port}"
         self.timeout = timeout
 
     def _request(self, method, path, body=None):
@@ -69,10 +86,25 @@ class Client:
         return json.loads(raw) if raw else {}
 
     def health(self):
+        in_use = PortInUseError(
+            f"Port {self.port} is in use by another program. Close it or set KIMODO_SERVICE_PORT to a free port."
+        )
         try:
-            return self._request("GET", "/health")
+            with urllib.request.urlopen(self.base + "/health", timeout=self.timeout) as resp:
+                health = json.loads(resp.read())
+        except (urllib.error.HTTPError, http.client.HTTPException, ValueError):
+            raise in_use from None
         except (urllib.error.URLError, ConnectionError, TimeoutError):
             return None
+        if not isinstance(health, dict) or health.get("service") != SERVICE_NAME:
+            raise in_use
+        if health.get("version") != SERVICE_VERSION:
+            raise ServiceError(
+                f"A Kimodo service of another version (v{health.get('version')}, this plugin needs "
+                f"v{SERVICE_VERSION}) is running on port {self.port}. Close the Houdini sessions that use it, or "
+                f"stop it, then press Generate again."
+            )
+        return health
 
     def generate(self, request):
         return self._request("POST", "/generate", request)["job_id"]

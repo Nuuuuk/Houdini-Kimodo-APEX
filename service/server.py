@@ -14,6 +14,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+SERVICE_NAME = "kimodo_motion"
+SERVICE_VERSION = 1
 DEFAULT_MODEL = "Kimodo-SOMA-RP-v1.2"
 MODELS = ("Kimodo-SOMA-RP-v1.2", "Kimodo-SOMA-RP-v1.1", "Kimodo-SOMA-RP-v1")
 NUM_TRANSITION_FRAMES = 5
@@ -201,6 +203,8 @@ class Service:
 
             vram = round(torch.cuda.memory_allocated() / 2**30, 2)
         return {
+            "service": SERVICE_NAME,
+            "version": SERVICE_VERSION,
             "status": self.status,
             "error": self.error,
             "models": sorted(self.models),
@@ -410,7 +414,12 @@ def make_handler(service, server_ref):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--port", type=int, default=44372)
+    ap.add_argument(
+        "--port",
+        type=int,
+        default=int(os.environ.get("KIMODO_SERVICE_PORT") or 44372),
+        help="default from env KIMODO_SERVICE_PORT, else 44372",
+    )
     ap.add_argument(
         "--text-encoder-device",
         choices=("cuda", "cpu"),
