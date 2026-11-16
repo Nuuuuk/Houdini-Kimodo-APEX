@@ -410,7 +410,7 @@ def make_handler(service, server_ref):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--port", type=int, default=8765)
+    ap.add_argument("--port", type=int, default=44372)
     ap.add_argument(
         "--text-encoder-device",
         choices=("cuda", "cpu"),

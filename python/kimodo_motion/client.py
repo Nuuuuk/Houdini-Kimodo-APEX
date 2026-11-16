@@ -12,7 +12,7 @@ import urllib.request
 import uuid
 
 HOST = "127.0.0.1"
-PORT = 8765
+PORT = 44372
 SESSION_ID = uuid.uuid4().hex
 _registered = set()
 
