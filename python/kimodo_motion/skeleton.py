@@ -1,5 +1,8 @@
 """kimodo motion to a soma 77 joint kinefx skeleton."""
 
+import json
+import os
+
 import numpy as np
 
 JOINT_NAMES = (
@@ -207,4 +210,31 @@ def build_geometry(geo, motion, index):
     points = geo.createPoints([tuple(p) for p in positions.tolist()])
     geo.setPointStringAttribValues("name", JOINT_NAMES)
     geo.setPointFloatAttribValues("transform", transform.ravel().tolist())
+    geo.createPolygons([(points[p], points[j]) for j, p in enumerate(PARENTS) if p >= 0], False)
+
+
+LIMBS = {
+    "L_arm": ("LeftArm", "LeftForeArm", "LeftHand"),
+    "R_arm": ("RightArm", "RightForeArm", "RightHand"),
+    "L_leg": ("LeftLeg", "LeftShin", "LeftFoot"),
+    "R_leg": ("RightLeg", "RightShin", "RightFoot"),
+}
+
+
+def rest_positions():
+    with open(os.path.join(os.path.dirname(__file__), "soma77_rest.json")) as f:
+        return np.array(json.load(f))
+
+
+def build_rest_geometry(geo):
+    import hou
+
+    geo.addAttrib(hou.attribType.Point, "name", "")
+    geo.addAttrib(hou.attribType.Point, "transform", (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0))
+    geo.addArrayAttrib(hou.attribType.Point, "tags", hou.attribData.String, 1)
+    points = geo.createPoints([tuple(p) for p in rest_positions().tolist()])
+    geo.setPointStringAttribValues("name", JOINT_NAMES)
+    for tag, joints in LIMBS.items():
+        for joint in joints:
+            points[JOINT_NAMES.index(joint)].setAttribValue("tags", [tag])
     geo.createPolygons([(points[p], points[j]) for j, p in enumerate(PARENTS) if p >= 0], False)

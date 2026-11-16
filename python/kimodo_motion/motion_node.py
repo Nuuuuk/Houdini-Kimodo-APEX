@@ -240,6 +240,58 @@ def cancel(node):
         gen.status("Canceling...", "canceling")
 
 
+ANIMATE_NODE = "animate"
+ANIMATE_STATE = "apexanimate"
+_edit_restore = {}
+
+
+def scene_viewer():
+    return hou.ui.paneTabOfType(hou.paneTabType.SceneViewer)
+
+
+def is_editing(node):
+    if not hou.isUIAvailable():
+        return False
+    viewer = scene_viewer()
+    return (viewer is not None and viewer.currentState() == ANIMATE_STATE and viewer.currentNode() == node.node(ANIMATE_NODE))
+
+
+def edit_pose(node):
+    """start posing in the shown scene view"""
+    if not read_doc(node)["result"]["npz"]:
+        set_status(node, "Generate a motion first; poses are edited on top of it.")
+        return False
+    viewer = scene_viewer()
+    if viewer is None:
+        set_status(node, "Open a Scene Viewer to edit poses.")
+        return False
+    inner = node.node(ANIMATE_NODE)
+    if not inner.isDisplayFlagSet():
+        set_status(
+            node,
+            "This node was made with an older version of the asset; create a new Kimodo Motion node to edit poses.",
+        )
+        return False
+    _edit_restore[node.sessionId()] = viewer.isPin()
+    viewer.setPin(True)
+    viewer.setPwd(node)
+    viewer.setCurrentNode(inner, False)
+    viewer.setCurrentState(ANIMATE_STATE)
+    node.setCurrent(True, clear_all_selected=True)
+    return is_editing(node)
+
+
+def end_edit(node):
+    """leave posing and show the node's own output again"""
+    viewer = scene_viewer()
+    if viewer is None:
+        return
+    viewer.setCurrentState("select")
+    viewer.setPwd(node.parent())
+    viewer.setPin(_edit_restore.pop(node.sessionId(), False))
+    node.setCurrent(True, clear_all_selected=True)
+
+
 def _motion(path):
     mtime = os.path.getmtime(path)
     cached = _motions.get(path)
@@ -266,3 +318,8 @@ def cook(sop):
     skeleton.build_geometry(geo, _motion(path), int(round(frame)) - 1)
     if error:
         raise hou.NodeWarning(f"The last Generate failed; this is the previous result.\n{error}")
+
+
+def cook_rest(sop):
+    """python sop: the rest skeleton the rig is built from"""
+    skeleton.build_rest_geometry(sop.geometry())

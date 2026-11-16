@@ -226,6 +226,17 @@ class KimodoPanel(QtWidgets.QWidget):
         self.lower_layout.setContentsMargins(0, 0, 0, 0)
         self.lower_layout.setSpacing(4)
         self.lower_layout.addWidget(self.status, 0)
+        self.edit_button = QtWidgets.QPushButton("Edit Pose")
+        self.edit_button.setToolTip("Pose the rig in the viewport at the current frame (APEX animate state).")
+        self.edit_button.clicked.connect(self.edit_pose)
+        self.done_button = QtWidgets.QPushButton("Done")
+        self.done_button.setToolTip("Leave pose editing and show the generated motion again.")
+        self.done_button.clicked.connect(self.end_edit)
+        pose_row = QtWidgets.QHBoxLayout()
+        pose_row.addWidget(self.edit_button)
+        pose_row.addWidget(self.done_button)
+        pose_row.addStretch(1)
+        self.lower_layout.addLayout(pose_row, 0)
         self.lower_layout.addStretch(1)
         self.splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
         self.splitter.addWidget(self.timeline)
@@ -246,7 +257,7 @@ class KimodoPanel(QtWidgets.QWidget):
         if node is not None:
             if self.parm_editor is None:
                 self.parm_editor = self.parm_editor_factory(node)
-                self.lower_layout.takeAt(1)
+                self.lower_layout.takeAt(2)
                 self.lower_layout.addWidget(self.parm_editor, 1)
             else:
                 self.parm_editor.setNode(node)
@@ -258,10 +269,23 @@ class KimodoPanel(QtWidgets.QWidget):
             if self.node is None:
                 return
             self.status.show_status(motion_node.get_status(self.node))
+            editing = motion_node.is_editing(self.node)
+            self.edit_button.setEnabled(not editing)
+            self.done_button.setEnabled(editing)
             prompts = motion_node.read_doc(self.node)["prompts"]
             self.timeline.canvas.set_state(prompts, int(round(hou.frame())) - 1)
         except (hou.ObjectWasDeleted, doc.DocError):
             self.node = None
+
+    def edit_pose(self):
+        if self.node is not None:
+            motion_node.edit_pose(self.node)
+            self.refresh()
+
+    def end_edit(self):
+        if self.node is not None:
+            motion_node.end_edit(self.node)
+            self.refresh()
 
     def dismiss_error(self):
         if self.node is not None:
