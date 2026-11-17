@@ -6,7 +6,7 @@ import numpy as np
 
 from .skeleton import NUM_JOINTS
 
-Pose = namedtuple("Pose", "local_rots root_position")
+Pose = namedtuple("Pose", "local_rots root_position root_2d", defaults=(None,))
 
 SOMA30_IN_77 = (
     0,
@@ -64,7 +64,12 @@ def to_kimodo_json(constraints, pose_source):
         if c["type"] in POSE_TYPES:
             entry["local_joints_rot"] = np.stack([matrix_to_axis_angle(p.local_rots) for p in poses]).tolist()
             entry["root_positions"] = root.tolist()
-        entry["smooth_root_2d"] = root[:, [0, 2]].tolist()
+        if c["type"] == "root2d":
+            entry["smooth_root_2d"] = [
+                list(map(float, root[i, [0, 2]] if p.root_2d is None else p.root_2d)) for i, p in enumerate(poses)
+            ]
+        else:
+            entry["smooth_root_2d"] = root[:, [0, 2]].tolist()
         out.append(entry)
     return out
 

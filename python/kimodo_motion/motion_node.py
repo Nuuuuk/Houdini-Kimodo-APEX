@@ -643,7 +643,8 @@ def cook_rig_source(sop):
         motion = _motion(path)
         i = min(max(frame, 0), motion.num_frames - 1)
         if stored is None:
-            return skeleton.build_geometry(sop.geometry(), motion, i)
+            positions, transform = skeleton.pose_arrays(motion, i)
+            return skeleton.write_geometry(sop.geometry(), positions, transform, with_root=True)
         local, root = motion.local_rots[i], motion.positions[i, 0].astype(np.float64)
     else:
         local, root = np.broadcast_to(np.eye(3), (skeleton.NUM_JOINTS, 3, 3)), skeleton.rest_positions()[0]
@@ -652,7 +653,9 @@ def cook_rig_source(sop):
             local = stored.local_rots
         root = np.where(np.isnan(stored.root_position), root, stored.root_position)
     positions, world = skeleton.fk(local, root)
-    skeleton.write_geometry(sop.geometry(), positions, np.swapaxes(world, -1, -2).reshape(skeleton.NUM_JOINTS, 9))
+    skeleton.write_geometry(
+        sop.geometry(), positions, np.swapaxes(world, -1, -2).reshape(skeleton.NUM_JOINTS, 9), with_root=True
+    )
 
 
 def cook_rig_output(sop):

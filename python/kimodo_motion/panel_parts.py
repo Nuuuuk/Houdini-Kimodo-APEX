@@ -103,8 +103,10 @@ class TimelineCanvas(FontSized):
         if event.button() == QtCore.Qt.RightButton and c is not None:
             menu = QtWidgets.QMenu(self)
             delete = menu.addAction("Delete")
-            types = menu.addMenu("Change Type")
-            actions = {types.addAction(TRACKS[i + 1]): t for i, t in enumerate(TRACK_TYPES) if t != c["type"]}
+            menu.addSeparator()
+            actions = {
+                menu.addAction(f"Change to {TRACKS[i + 1]}"): t for i, t in enumerate(TRACK_TYPES) if t != c["type"]
+            }
             chosen = menu.exec(event.globalPosition().toPoint())
             if chosen is delete:
                 self.delete_requested.emit(c["id"])

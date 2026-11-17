@@ -221,17 +221,34 @@ def fk(local_rots, root_position):
     return positions, world
 
 
-def write_geometry(geo, positions, transform):
+def write_geometry(geo, positions, transform, with_root=False, tags=None):
     """kinefx skeleton from joint positions and transforms"""
     import hou
 
+    positions, transform = (
+        np.asarray(positions, dtype=np.float64),
+        np.asarray(transform, dtype=np.float64).reshape(-1, 9),
+    )
+    names = list(JOINT_NAMES)
+    if with_root:
+        names.append(ROOT)
+        positions = np.vstack([positions, [positions[0, 0], 0.0, positions[0, 2]]])
+        transform = np.vstack([transform, np.eye(3).reshape(1, 9)])
     geo.addAttrib(hou.attribType.Point, "name", "")
     geo.addAttrib(hou.attribType.Point, "transform", (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0))
-    points = geo.createPoints([tuple(p) for p in np.asarray(positions).tolist()])
-    geo.setPointStringAttribValues("name", JOINT_NAMES)
-    geo.setPointFloatAttribValues("transform", np.asarray(transform).ravel().tolist())
+    points = geo.createPoints([tuple(p) for p in positions.tolist()])
+    geo.setPointStringAttribValues("name", names)
+    geo.setPointFloatAttribValues("transform", transform.ravel().tolist())
+    if tags:
+        geo.addArrayAttrib(hou.attribType.Point, "tags", hou.attribData.String, 1)
+        for joint, joint_tags in tags.items():
+            points[names.index(joint)].setAttribValue("tags", list(joint_tags))
+    if with_root:
+        geo.createPolygons([(points[NUM_JOINTS], points[0])], False)
     geo.createPolygons([(points[p], points[j]) for j, p in enumerate(PARENTS) if p >= 0], False)
 
+
+ROOT = "Root"
 
 LIMBS = {
     "L_arm": ("LeftArm", "LeftForeArm", "LeftHand"),
@@ -239,6 +256,11 @@ LIMBS = {
     "L_leg": ("LeftLeg", "LeftShin", "LeftFoot"),
     "R_leg": ("RightLeg", "RightShin", "RightFoot"),
 }
+IK_JOINTS = tuple(j for limb in LIMBS.values() for j in limb)
+FK_JOINTS = tuple(j for j in JOINT_NAMES if j != "Hips" and j not in IK_JOINTS)
+FK_HIDDEN = tuple(j for j in FK_JOINTS if j.endswith("End") or j in ("Jaw", "LeftEye", "RightEye"))
+FK_CONTROLS = tuple(j for j in FK_JOINTS if j not in FK_HIDDEN)
+ROOT_CONTROL, COG_CONTROL = "Root_ctrl", "COG_ctrl"
 
 
 def rest_positions():
@@ -247,14 +269,5 @@ def rest_positions():
 
 
 def build_rest_geometry(geo):
-    import hou
-
-    geo.addAttrib(hou.attribType.Point, "name", "")
-    geo.addAttrib(hou.attribType.Point, "transform", (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0))
-    geo.addArrayAttrib(hou.attribType.Point, "tags", hou.attribData.String, 1)
-    points = geo.createPoints([tuple(p) for p in rest_positions().tolist()])
-    geo.setPointStringAttribValues("name", JOINT_NAMES)
-    for tag, joints in LIMBS.items():
-        for joint in joints:
-            points[JOINT_NAMES.index(joint)].setAttribValue("tags", [tag])
-    geo.createPolygons([(points[p], points[j]) for j, p in enumerate(PARENTS) if p >= 0], False)
+    tags = {joint: [tag] for tag, joints in LIMBS.items() for joint in joints}
+    write_geometry(geo, rest_positions(), np.tile(np.eye(3).reshape(9), (NUM_JOINTS, 1)), with_root=True, tags=tags)
