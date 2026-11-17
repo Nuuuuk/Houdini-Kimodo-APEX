@@ -1,6 +1,8 @@
 """talks to the kimodo service over http, stdlib only."""
 
+import atexit
 import hashlib
+import http.client
 import json
 import os
 import subprocess
@@ -8,13 +10,35 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import uuid
 
 HOST = "127.0.0.1"
-PORT = 8765
+PORT = 44372
+SERVICE_NAME = "kimodo_motion"
+SERVICE_VERSION = 1
+SESSION_ID = uuid.uuid4().hex
+_registered = set()
 
 
 class ServiceError(RuntimeError):
     pass
+
+
+class PortInUseError(ServiceError):
+    pass
+
+
+def service_port():
+    value = os.environ.get("KIMODO_SERVICE_PORT", "").strip()
+    if not value:
+        return PORT
+    if not value.isdigit() or not 0 < int(value) < 65536:
+        raise ServiceError(f"KIMODO_SERVICE_PORT must be a port number (1-65535), got {value!r}")
+    return int(value)
+
+
+def text_encoder_device():
+    return os.environ.get("KIMODO_TEXT_ENCODER_DEVICE", "cuda")
 
 
 def make_request(doc, constraints_json):
@@ -31,6 +55,7 @@ def make_request(doc, constraints_json):
         "num_samples": g["num_samples"],
         "postprocess": g["postprocess"],
         "root_margin": g["root_margin"],
+        "text_encoder_device": text_encoder_device(),
     }
 
 
@@ -42,8 +67,9 @@ def cache_key(request):
 
 
 class Client:
-    def __init__(self, host=HOST, port=PORT, timeout=10.0):
-        self.base = f"http://{host}:{port}"
+    def __init__(self, host=HOST, port=None, timeout=10.0):
+        self.port = port or service_port()
+        self.base = f"http://{host}:{self.port}"
         self.timeout = timeout
 
     def _request(self, method, path, body=None):
@@ -60,10 +86,25 @@ class Client:
         return json.loads(raw) if raw else {}
 
     def health(self):
+        in_use = PortInUseError(
+            f"Port {self.port} is in use by another program. Close it or set KIMODO_SERVICE_PORT to a free port."
+        )
         try:
-            return self._request("GET", "/health")
+            with urllib.request.urlopen(self.base + "/health", timeout=self.timeout) as resp:
+                health = json.loads(resp.read())
+        except (urllib.error.HTTPError, http.client.HTTPException, ValueError):
+            raise in_use from None
         except (urllib.error.URLError, ConnectionError, TimeoutError):
             return None
+        if not isinstance(health, dict) or health.get("service") != SERVICE_NAME:
+            raise in_use
+        if health.get("version") != SERVICE_VERSION:
+            raise ServiceError(
+                f"A Kimodo service of another version (v{health.get('version')}, this plugin needs "
+                f"v{SERVICE_VERSION}) is running on port {self.port}. Close the Houdini sessions that use it, or "
+                f"stop it, then press Generate again."
+            )
+        return health
 
     def generate(self, request):
         return self._request("POST", "/generate", request)["job_id"]
@@ -76,6 +117,20 @@ class Client:
 
     def shutdown(self):
         return self._request("POST", "/shutdown", {})
+
+    def register_session(self):
+        if self.base in _registered:
+            return
+        self._request("POST", "/clients/register", {"id": SESSION_ID, "pid": os.getpid()})
+        _registered.add(self.base)
+        atexit.register(self._unregister_quietly)
+
+    def _unregister_quietly(self):
+        self.timeout = 2.0
+        try:
+            self._request("POST", "/clients/unregister", {"id": SESSION_ID})
+        except Exception:
+            pass
 
     def ensure_running(self, timeout=300.0, poll=1.0, on_wait=None):
         """start the service if needed and wait until it's ready"""

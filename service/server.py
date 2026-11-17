@@ -14,6 +14,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+SERVICE_NAME = "kimodo_motion"
+SERVICE_VERSION = 1
 DEFAULT_MODEL = "Kimodo-SOMA-RP-v1.2"
 MODELS = ("Kimodo-SOMA-RP-v1.2", "Kimodo-SOMA-RP-v1.1", "Kimodo-SOMA-RP-v1")
 NUM_TRANSITION_FRAMES = 5
@@ -70,6 +72,8 @@ def parse_request(body):
     need(isinstance(req["steps"], int) and req["steps"] > 0, "steps must be a positive integer")
     need(isinstance(req["num_samples"], int) and req["num_samples"] > 0, "num_samples must be a positive integer")
     need(req["root_margin"] is None or isinstance(req["root_margin"], (int, float)), "root_margin must be a number")
+    req["text_encoder_device"] = body.get("text_encoder_device")
+    need(req["text_encoder_device"] in (None, "cuda", "cpu"), "text_encoder_device must be cuda or cpu")
     return req
 
 
@@ -105,14 +109,64 @@ class Canceled(Exception):
     pass
 
 
+def pid_alive(pid):
+    import psutil
+
+    return psutil.pid_exists(pid)
+
+
 class Service:
-    def __init__(self, text_encoder_device="cuda", preload=(DEFAULT_MODEL,)):
+    def __init__(self, text_encoder_device="cuda", preload=(DEFAULT_MODEL,), idle_timeout=30 * 60.0):
         self.text_encoder_device = text_encoder_device
         self.preload = preload
         self.status, self.error = "loading", None
         self.models, self.text_encoder = {}, None
         self.jobs, self.queue = {}, queue.Queue()
         self.lock = threading.Lock()
+        self.idle_timeout = idle_timeout
+        self.clients, self.had_clients = {}, False
+        self.last_activity = time.monotonic()
+        self.pid_alive = pid_alive
+
+    def register(self, client_id, pid):
+        with self.lock:
+            self.clients[client_id] = int(pid)
+            self.had_clients = True
+            self.last_activity = time.monotonic()
+        print(f"client registered: {client_id} (pid {pid}), {len(self.clients)} active", flush=True)
+
+    def unregister(self, client_id):
+        with self.lock:
+            self.clients.pop(client_id, None)
+        print(f"client unregistered: {client_id}, {len(self.clients)} active", flush=True)
+
+    def busy(self):
+        return any(j["status"] in ("queued", "running") for j in self.jobs.values())
+
+    def check_lifetime(self, now=None):
+        """reason to shut down now, or None"""
+        now = time.monotonic() if now is None else now
+        with self.lock:
+            for cid, pid in list(self.clients.items()):
+                if not self.pid_alive(pid):
+                    print(f"client {cid} (pid {pid}) is gone", flush=True)
+                    del self.clients[cid]
+            if self.busy():
+                return None
+            if self.had_clients and not self.clients:
+                return "the last Houdini session using the service has exited"
+            if self.idle_timeout and now - self.last_activity > self.idle_timeout:
+                return f"idle for {self.idle_timeout / 60:.0f} min"
+        return None
+
+    def monitor(self, stop, interval=5.0):
+        while True:
+            time.sleep(interval)
+            reason = self.check_lifetime()
+            if reason:
+                print(f"Shutting down: {reason}", flush=True)
+                stop()
+                return
 
     def load(self):
         try:
@@ -149,19 +203,37 @@ class Service:
 
             vram = round(torch.cuda.memory_allocated() / 2**30, 2)
         return {
+            "service": SERVICE_NAME,
+            "version": SERVICE_VERSION,
             "status": self.status,
             "error": self.error,
             "models": sorted(self.models),
             "vram_gib": vram,
             "text_encoder_device": self.text_encoder_device,
             "cached_prompts": len(self.text_encoder.cache) if self.text_encoder else 0,
+            "clients": len(self.clients),
+            "idle_timeout_min": (self.idle_timeout or 0) / 60,
         }
 
     def submit(self, body):
         req = parse_request(body)
+        if req["text_encoder_device"] not in (None, self.text_encoder_device):
+            raise RequestError(
+                f"the running service encodes text on {self.text_encoder_device}, the request expects "
+                f"{req['text_encoder_device']}; shut the service down so it restarts with the new setting"
+            )
         job_id = uuid.uuid4().hex[:12]
         with self.lock:
-            self.jobs[job_id] = {"status": "queued", "progress": 0.0, "npz": [], "bvh": [], "error": None}
+            self.last_activity = time.monotonic()
+            self.jobs[job_id] = {
+                "status": "queued",
+                "progress": 0.0,
+                "npz": [],
+                "bvh": [],
+                "error": None,
+                "started_at": None,
+                "finished_at": None,
+            }
         self.queue.put((job_id, req))
         return job_id
 
@@ -189,7 +261,7 @@ class Service:
             try:
                 if self.status != "ready":
                     raise RuntimeError(f"service failed to load: {self.error}")
-                job["status"] = "running"
+                job.update(status="running", started_at=time.time())
                 npz, bvh = self.run(req, job)
                 job.update(status="done", progress=1.0, npz=npz, bvh=bvh)
             except Canceled:
@@ -197,6 +269,8 @@ class Service:
             except Exception as e:
                 traceback.print_exc()
                 job.update(status="error", error=f"{type(e).__name__}: {e}")
+            job["finished_at"] = time.time()
+            self.last_activity = time.monotonic()
 
     def run(self, req, job):
         """generate exactly like kimodo_gen"""
@@ -220,21 +294,26 @@ class Service:
         kwargs = {}
         if req["root_margin"] is not None:
             kwargs["root_margin"] = float(req["root_margin"])
-        output = model(
-            req["texts"],
-            req["num_frames"],
-            constraint_lst=constraint_lst,
-            num_denoising_steps=req["steps"],
-            num_samples=req["num_samples"],
-            multi_prompt=True,
-            num_transition_frames=NUM_TRANSITION_FRAMES,
-            post_processing=req["postprocess"],
-            return_numpy=True,
-            cfg_type="separated",
-            cfg_weight=[req["cfg_text"], req["cfg_constraint"]],
-            progress_bar=progress,
-            **kwargs,
-        )
+        generate_inner = model._generate
+        model._generate = lambda *a, **kw: generate_inner(*a, **{"progress_bar": progress, **kw})
+        try:
+            output = model(
+                req["texts"],
+                req["num_frames"],
+                constraint_lst=constraint_lst,
+                num_denoising_steps=req["steps"],
+                num_samples=req["num_samples"],
+                multi_prompt=True,
+                num_transition_frames=NUM_TRANSITION_FRAMES,
+                post_processing=req["postprocess"],
+                return_numpy=True,
+                cfg_type="separated",
+                cfg_weight=[req["cfg_text"], req["cfg_constraint"]],
+                progress_bar=progress,
+                **kwargs,
+            )
+        finally:
+            del model._generate
 
         os.makedirs(req["output_dir"], exist_ok=True)
         n = int(output["posed_joints"].shape[0])
@@ -316,6 +395,14 @@ def make_handler(service, server_ref):
                 if parts[1] not in service.jobs:
                     return self.send(404, {"error": f"no job {parts[1]}"})
                 return self.send(200, service.cancel(parts[1]))
+            if self.path == "/clients/register":
+                if not isinstance(body.get("id"), str) or not isinstance(body.get("pid"), int):
+                    return self.send(400, {"error": "register needs a string id and an integer pid"})
+                service.register(body["id"], body["pid"])
+                return self.send(200, {"clients": len(service.clients)})
+            if self.path == "/clients/unregister":
+                service.unregister(str(body.get("id")))
+                return self.send(200, {"clients": len(service.clients)})
             if self.path == "/shutdown":
                 self.send(200, {})
                 threading.Thread(target=server_ref[0].shutdown, daemon=True).start()
@@ -327,7 +414,12 @@ def make_handler(service, server_ref):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--port", type=int, default=8765)
+    ap.add_argument(
+        "--port",
+        type=int,
+        default=int(os.environ.get("KIMODO_SERVICE_PORT") or 44372),
+        help="default from env KIMODO_SERVICE_PORT, else 44372",
+    )
     ap.add_argument(
         "--text-encoder-device",
         choices=("cuda", "cpu"),
@@ -335,17 +427,25 @@ def main():
         help="cpu: run the text encoder on the CPU, for GPUs with less than ~16 GB "
         "(default from env KIMODO_TEXT_ENCODER_DEVICE, else cuda)",
     )
+    ap.add_argument(
+        "--idle-timeout",
+        type=float,
+        default=float(os.environ.get("KIMODO_SERVICE_IDLE_MINUTES", 30)),
+        help="minutes without jobs before the service exits; 0 = never "
+        "(default from env KIMODO_SERVICE_IDLE_MINUTES, else 30)",
+    )
     args = ap.parse_args()
 
     set_default_env()
     if args.text_encoder_device == "cpu":
         os.environ["TEXT_ENCODER_DEVICE"] = "cpu"
-    service = Service(text_encoder_device=args.text_encoder_device)
+    service = Service(text_encoder_device=args.text_encoder_device, idle_timeout=args.idle_timeout * 60)
     server_ref = []
     server = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(service, server_ref))
     server_ref.append(server)
     threading.Thread(target=service.load, daemon=True).start()
     threading.Thread(target=service.worker, daemon=True).start()
+    threading.Thread(target=service.monitor, args=(server.shutdown,), daemon=True).start()
     print(f"Kimodo service listening on http://127.0.0.1:{args.port}", flush=True)
     server.serve_forever()
     server.server_close()

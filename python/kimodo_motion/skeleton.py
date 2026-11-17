@@ -1,5 +1,8 @@
 """kimodo motion to a soma 77 joint kinefx skeleton."""
 
+import json
+import os
+
 import numpy as np
 
 JOINT_NAMES = (
@@ -202,9 +205,56 @@ def build_geometry(geo, motion, index):
     import hou
 
     positions, transform = pose_arrays(motion, index)
+    write_geometry(geo, positions, transform)
+
+
+def fk(local_rots, root_position):
+    """world positions and rotations of a pose"""
+    rest = rest_positions()
+    world = np.array(local_rots, dtype=np.float64)
+    positions = np.zeros((NUM_JOINTS, 3))
+    positions[0] = root_position
+    for j in range(1, NUM_JOINTS):
+        p = PARENTS[j]
+        world[j] = world[p] @ world[j]
+        positions[j] = positions[p] + world[p] @ (rest[j] - rest[p])
+    return positions, world
+
+
+def write_geometry(geo, positions, transform):
+    """kinefx skeleton from joint positions and transforms"""
+    import hou
+
     geo.addAttrib(hou.attribType.Point, "name", "")
     geo.addAttrib(hou.attribType.Point, "transform", (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0))
-    points = geo.createPoints([tuple(p) for p in positions.tolist()])
+    points = geo.createPoints([tuple(p) for p in np.asarray(positions).tolist()])
     geo.setPointStringAttribValues("name", JOINT_NAMES)
-    geo.setPointFloatAttribValues("transform", transform.ravel().tolist())
+    geo.setPointFloatAttribValues("transform", np.asarray(transform).ravel().tolist())
+    geo.createPolygons([(points[p], points[j]) for j, p in enumerate(PARENTS) if p >= 0], False)
+
+
+LIMBS = {
+    "L_arm": ("LeftArm", "LeftForeArm", "LeftHand"),
+    "R_arm": ("RightArm", "RightForeArm", "RightHand"),
+    "L_leg": ("LeftLeg", "LeftShin", "LeftFoot"),
+    "R_leg": ("RightLeg", "RightShin", "RightFoot"),
+}
+
+
+def rest_positions():
+    with open(os.path.join(os.path.dirname(__file__), "soma77_rest.json")) as f:
+        return np.array(json.load(f))
+
+
+def build_rest_geometry(geo):
+    import hou
+
+    geo.addAttrib(hou.attribType.Point, "name", "")
+    geo.addAttrib(hou.attribType.Point, "transform", (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0))
+    geo.addArrayAttrib(hou.attribType.Point, "tags", hou.attribData.String, 1)
+    points = geo.createPoints([tuple(p) for p in rest_positions().tolist()])
+    geo.setPointStringAttribValues("name", JOINT_NAMES)
+    for tag, joints in LIMBS.items():
+        for joint in joints:
+            points[JOINT_NAMES.index(joint)].setAttribValue("tags", [tag])
     geo.createPolygons([(points[p], points[j]) for j, p in enumerate(PARENTS) if p >= 0], False)
