@@ -77,8 +77,16 @@ def doc_from_parms(node):
     """the doc with the model and generation settings from the parms"""
     d = read_doc(node)
     d["model"] = node.evalParm("model")
-    frames = int(round(node.evalParm("duration") * doc.FPS))
-    d["prompts"] = [{"id": "p1", "text": node.parm("prompt").unexpandedString(), "start_frame": 0, "end_frame": frames}]
+    if len(d["prompts"]) == 1:
+        frames = int(round(node.evalParm("duration") * doc.FPS))
+        d["prompts"] = [
+            {
+                "id": d["prompts"][0]["id"],
+                "text": node.parm("prompt").unexpandedString(),
+                "start_frame": 0,
+                "end_frame": frames,
+            }
+        ]
     d["generation"] = {
         "seed": node.evalParm("seed"),
         "steps": node.evalParm("steps"),
@@ -192,27 +200,6 @@ def add_constraint(node, ctype, frame, auto=False):
     update_unapplied(node)
     set_status(node, f"{TYPE_LABELS[ctype]} keyframe added at frame {frame + 1}.")
     return entry["id"]
-
-
-def delete_constraint(node, cid):
-    d = read_doc(node)
-    gone = [c for c in d["constraints"] if c["id"] == cid]
-    if not gone:
-        return
-    d["constraints"] = [c for c in d["constraints"] if c["id"] != cid]
-    freed = sorted(set(gone[0]["frames"]) - set(constraint_frames(d)))
-
-    def apply():
-        with hou.undos.group("Delete Kimodo constraint"):
-            write_doc(node, d)
-            poses = read_poses(node)
-            if any(f in poses for f in freed):
-                write_poses(node, {f: p for f, p in poses.items() if f not in freed})
-            rig.snap(node, freed)
-
-    _outside_edit(node, apply)
-    update_unapplied(node)
-    set_status(node, f"{TYPE_LABELS[gone[0]['type']]} constraint deleted.")
 
 
 def set_constraint_type(node, cid, ctype):
