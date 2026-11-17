@@ -221,10 +221,26 @@ def fk(local_rots, root_position):
     return positions, world
 
 
+def _hip_line(rotation):
+    rest = rest_positions()
+    line = rotation @ (rest[JOINT_NAMES.index("RightLeg")] - rest[JOINT_NAMES.index("LeftLeg")])
+    length = np.hypot(line[0], line[2])
+    return None if length < 1e-9 else np.array([line[0], line[2]]) / length
+
+
+def with_heading(rotation, like):
+    """rotation turned about y to the heading of like"""
+    mine, wanted = _hip_line(rotation), _hip_line(like)
+    if mine is None or wanted is None:
+        return np.array(rotation, dtype=np.float64)
+    c, s = wanted[0] * mine[0] + wanted[1] * mine[1], wanted[0] * mine[1] - wanted[1] * mine[0]
+    return np.array([[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]]) @ rotation
+
+
 def pinned_pose(base_local, stored_local, stored_root, tips):
     """base pose with only what hand and foot constraints pin from the stored pose"""
     local = np.array(base_local, dtype=np.float64)
-    local[0] = stored_local[0]
+    local[0] = with_heading(local[0], stored_local[0])
     positions, world = fk(local, stored_root)
     stored_positions, stored_world = fk(stored_local, stored_root)
     rest = rest_positions()
@@ -239,6 +255,23 @@ def pinned_pose(base_local, stored_local, stored_root, tips):
             positions[j] = positions[p] + world[p] @ (rest[j] - rest[p])
             moved.add(j)
     return positions, world
+
+
+TIPS = {"left-hand": "LeftHand", "right-hand": "RightHand", "left-foot": "LeftFoot", "right-foot": "RightFoot"}
+
+
+def composed_pose(base_local, base_root, stored_local, stored_root, stored_root_2d, ctypes):
+    """the pose the rig follows on a frame with a stored pose"""
+    if stored_local is not None and ("fullbody" in ctypes or not ctypes):
+        return fk(stored_local, stored_root)
+    tips = {TIPS[ctype] for ctype in ctypes if ctype in TIPS}
+    if stored_local is not None and tips:
+        return pinned_pose(base_local, stored_local, stored_root, tips)
+    x, z = (stored_root[0], stored_root[2]) if stored_root_2d is None else stored_root_2d
+    root = np.array(base_root, dtype=np.float64)
+    if not (np.isnan(x) or np.isnan(z)):
+        root[0], root[2] = x, z
+    return fk(base_local, root)
 
 
 def write_geometry(geo, positions, transform, with_root=False, tags=None):

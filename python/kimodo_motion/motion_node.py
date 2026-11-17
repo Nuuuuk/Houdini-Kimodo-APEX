@@ -1,10 +1,11 @@
 """the node side of things: generate, status, stored poses, the cooks."""
 
-import hashlib
+import base64
 import hashlib
 import json
 import os
 import time
+import zlib
 
 import hou
 import numpy as np
@@ -96,7 +97,10 @@ _poses_cache = {}
 
 def read_poses(node):
     """{frame: Pose}, a root only pose has local_rots None"""
-    text = node.parm("kimodo_poses").unexpandedString()
+    return _parse_poses(node.parm("kimodo_poses").unexpandedString())
+
+
+def _parse_poses(text):
     cached = _poses_cache.get(text)
     if cached is None:
         raw = json.loads(text) if text.strip() else {}
@@ -104,6 +108,7 @@ def read_poses(node):
             int(f): constraints.Pose(
                 None if p["rot"] is None else constraints.axis_angle_to_matrix(np.array(p["rot"])),
                 np.array([np.nan if v is None else v for v in p["root"]], dtype=np.float64),
+                None if p.get("root2d") is None else tuple(p["root2d"]),
             )
             for f, p in raw.items()
         }
@@ -113,14 +118,61 @@ def read_poses(node):
 
 
 def write_poses(node, poses):
-    raw = {
-        str(f): {
+    old_text = node.parm("kimodo_poses").unexpandedString()
+    old, old_raw = _parse_poses(old_text), (json.loads(old_text) if old_text.strip() else {})
+    raw = {}
+    for f, p in sorted(poses.items()):
+        if old.get(f) is p:
+            raw[str(f)] = old_raw[str(f)]
+            continue
+        raw[str(f)] = {
             "rot": None if p.local_rots is None else constraints.matrix_to_axis_angle(p.local_rots).tolist(),
             "root": [None if np.isnan(v) else float(v) for v in p.root_position],
         }
-        for f, p in sorted(poses.items())
-    }
-    node.parm("kimodo_poses").set(json.dumps(raw))
+        if p.root_2d is not None:
+            raw[str(f)]["root2d"] = [float(v) for v in p.root_2d]
+    text = json.dumps(raw) if raw else ""
+    if old_text != text:
+        node.parm("kimodo_poses").set(text)
+    return _parse_poses(text)
+
+
+_captured = {}
+
+
+def capture_poses(node, d, reference=None, record=False):
+    """store the pose each constraint frame sends now"""
+    frames = constraint_frames(d)
+    stored = dict(read_poses(node))
+    top = rig.stash(node)
+    if top is None:
+        edited = set()
+    elif reference is not None:
+        edited = rig._differing_frames(rig.channels(top), rig.channels(reference), frames)
+    elif rig.stash_tag(node) in (None, rig.source_tag(node)):
+        edited = set(rig.edited_frames(node, only=frames))
+    else:
+        edited = set(frames)
+    mine = rig.channels(top) if top is not None else None
+    taken = _captured.setdefault(node.sessionId(), {})
+    for frame in frames:
+        if frame in stored and frame not in edited:
+            continue
+        keys = None if mine is None else np.array([prim.eval(float(frame + 1)) for prim in mine.values()]).tobytes()
+        if frame in stored and keys is not None and taken.get(frame) == keys:
+            continue
+        pose = rig.pose(node, frame)
+        stored[frame] = constraints.Pose(pose.local_rots, pose.root_position, pose.root_2d)
+        taken[frame] = keys
+    stored = {frame: pose for frame, pose in stored.items() if frame in frames}
+    if record:
+        stored = write_poses(node, stored)
+        write_rig_keep(node, d, record=True)
+    else:
+        with hou.undos.disabler():
+            stored = write_poses(node, stored)
+            write_rig_keep(node, d)
+    return stored
 
 
 def constraint_frames(d):
@@ -188,59 +240,56 @@ def release_unpinned(node, d):
             rig.snap(node, list(keep), keep)
 
 
-def applied_key(node, d):
-    """key of the constraints the shown result was made with"""
-    top = rig.stash(node)
-    mine = rig.channels(top) if top is not None else None
-    stored = read_poses(node)
-    edited = set(rig.edited_frames(node, only=[f for f in constraint_frames(d) if f in stored]))
-    raw = json.loads(node.parm("kimodo_poses").unexpandedString() or "{}")
-    parts = []
-    for c in d["constraints"]:
-        names = rig.kept_channels({c["type"]})
-        pinned = []
-        for frame in c["frames"]:
-            if frame in stored and frame not in edited:
-                pinned.append(["stored", raw[str(frame)]])
-            elif mine is None:
-                pinned.append(["generated"])
-            else:
-                pinned.append(
-                    [
-                        mine[name].eval(float(frame + 1))
-                        for name in sorted(mine if names is None else names)
-                        if name in mine
-                    ]
-                )
-        parts.append([c["type"], list(c["frames"]), pinned])
-    return constraints_key(parts)
-
-
-def write_rig_keep(node, d):
-    stored = read_poses(node)
+def _rig_keep_text(d, stored):
     keep = {}
     for c in d["constraints"]:
         for frame in c["frames"]:
-            if frame in stored and stored[frame].local_rots is not None:
+            if frame in stored:
                 keep.setdefault(frame, set()).add(c["type"])
-    text = json.dumps({str(f): sorted(t - {"root2d"}) for f, t in sorted(keep.items()) if "fullbody" not in t})
-    text = "" if text == "{}" else text
+    text = json.dumps({str(f): sorted(t) for f, t in sorted(keep.items())})
+    return "" if text == "{}" else text
+
+
+def write_rig_keep(node, d, record=False):
+    text = _rig_keep_text(d, read_poses(node))
     if node.parm("rig_keep").unexpandedString() != text:
-        with hou.undos.disabler():
+        if record:
             node.parm("rig_keep").set(text)
+        else:
+            with hou.undos.disabler():
+                node.parm("rig_keep").set(text)
+
+
+def _change_constraints(node, before, d, label, freed=(), force=False):
+    stored = read_poses(node)
+    frames = set(constraint_frames(d))
+    left = {frame: pose for frame, pose in stored.items() if frame in frames}
+    rebuild = force or len(left) != len(stored) or _rig_keep_text(d, left) != node.parm("rig_keep").unexpandedString()
+
+    def apply():
+        with hou.undos.group(label):
+            if rebuild:
+                captured = capture_poses(node, before, record=True)
+                write_poses(node, {frame: pose for frame, pose in captured.items() if frame in frames})
+            write_doc(node, d)
+            write_rig_keep(node, d, record=True)
+            if rig.stash(node) is not None:
+                if rig.stash_tag(node) != rig.source_tag(node):
+                    rig.merge(node, {}, rig.source_tag(node))
+                else:
+                    rig.snap(node, list(freed))
+
+    _outside_edit(node, apply)
 
 
 def update_unapplied(node):
     """unapplied: do the constraints differ from the ones the result was made with"""
     d = read_doc(node)
-    result = d["result"]
-    unapplied = 0
-    if result["npz"]:
-        try:
-            unapplied = int(applied_key(node, d) != result.get("applied", NO_CONSTRAINTS))
-        except rig.NotReady:
-            _retry.add(node.sessionId())
-            return False
+    try:
+        unapplied = int(constraints_key(constraints_json(node, d)) != d["result"].get("applied", NO_CONSTRAINTS))
+    except rig.NotReady:
+        _retry.add(node.sessionId())
+        return False
     if node.evalParm("unapplied") != unapplied:
         with hou.undos.disabler():
             node.parm("unapplied").set(unapplied)
@@ -259,13 +308,15 @@ def add_constraint(node, ctype, frame, auto=False):
         return None
     if any(c["type"] == ctype and frame in c["frames"] for c in d["constraints"]):
         return None
+    before = json.loads(json.dumps(d))
     entry = {"id": _new_id(d), "type": ctype, "frames": [frame]}
     if auto:
         entry["auto"] = True
     d["constraints"].append(entry)
-    ensure_stash(node)
-    write_doc(node, d)
-    write_rig_keep(node, d)
+    if frame in read_poses(node):
+        _change_constraints(node, before, d, "Add Kimodo constraint")
+    else:
+        write_doc(node, d)
     update_unapplied(node)
     set_status(node, f"{TYPE_LABELS[ctype]} keyframe added at frame {frame + 1}.")
     return entry["id"]
@@ -279,43 +330,25 @@ def ensure_stash(node):
 
 
 def delete_constraint(node, cid):
-    d = read_doc(node)
-    gone = [c for c in d["constraints"] if c["id"] == cid]
+    before = read_doc(node)
+    gone = [c for c in before["constraints"] if c["id"] == cid]
     if not gone:
         return
-    d["constraints"] = [c for c in d["constraints"] if c["id"] != cid]
+    d = dict(before, constraints=[c for c in before["constraints"] if c["id"] != cid])
     freed = sorted(set(gone[0]["frames"]) - set(constraint_frames(d)))
-
-    def apply():
-        with hou.undos.group("Delete Kimodo constraint"):
-            write_doc(node, d)
-            poses = read_poses(node)
-            if any(f in poses for f in freed):
-                write_poses(node, {f: p for f, p in poses.items() if f not in freed})
-            write_rig_keep(node, d)
-            rig.snap(node, gone[0]["frames"], kept_keys(d))
-
-    _outside_edit(node, apply)
+    _change_constraints(node, before, d, "Delete Kimodo constraint", freed)
     update_unapplied(node)
     set_status(node, f"{TYPE_LABELS[gone[0]['type']]} constraint deleted.")
 
 
 def set_constraint_type(node, cid, ctype):
-    d = read_doc(node)
-    frames = []
+    before = read_doc(node)
+    d = json.loads(json.dumps(before))
     for c in d["constraints"]:
         if c["id"] == cid:
             c["type"] = ctype
             c.pop("auto", None)
-            frames = c["frames"]
-
-    def apply():
-        with hou.undos.group("Change Kimodo constraint type"):
-            write_doc(node, d)
-            write_rig_keep(node, d)
-            rig.snap(node, frames, kept_keys(d))
-
-    _outside_edit(node, apply)
+    _change_constraints(node, before, d, "Change Kimodo constraint type", force=True)
     update_unapplied(node)
     set_status(node, f"Constraint set to {TYPE_LABELS[ctype]}.")
 
@@ -389,10 +422,14 @@ def update_auto_constraints(node, only=None):
         return False
     constrained = set(constraint_frames(d))
     added = sorted(edited - constrained)
+    stored = read_poses(node)
     removed = [
         c
         for c in d["constraints"]
-        if c.get("auto") and c["frames"][0] not in edited and (only is None or c["frames"][0] in only)
+        if c.get("auto")
+        and c["frames"][0] not in edited
+        and c["frames"][0] not in stored
+        and (only is None or c["frames"][0] in only)
     ]
     if not added and not removed:
         return True
@@ -412,6 +449,40 @@ def update_auto_constraints(node, only=None):
     return True
 
 
+def embed_results(node, paths):
+    """compressed copy of the result files in the node"""
+    stored = {}
+    for path in paths:
+        with open(hou.text.expandString(path), "rb") as f:
+            stored[path] = base64.b64encode(zlib.compress(f.read(), 6)).decode("ascii")
+    with hou.undos.disabler():
+        node.parm("kimodo_results").set(json.dumps(stored))
+
+
+_embedded = {}
+
+
+def result_file(node, path):
+    """the result file, put back from the node's copy if it's missing"""
+    expanded = hou.text.expandString(path)
+    if not path or os.path.isfile(expanded):
+        return expanded
+    text = node.parm("kimodo_results").unexpandedString()
+    if text not in _embedded:
+        _embedded.clear()
+        _embedded[text] = json.loads(text) if text else {}
+    stored = _embedded[text].get(path)
+    if stored is not None:
+        try:
+            os.makedirs(os.path.dirname(expanded), exist_ok=True)
+            with open(expanded + ".restoring", "wb") as f:
+                f.write(zlib.decompress(base64.b64decode(stored)))
+            os.replace(expanded + ".restoring", expanded)
+        except OSError:
+            pass
+    return expanded
+
+
 def shown_result(node):
     """'<request key>:<sample>' of the shown sample, '' while there is none"""
     paths = read_doc(node)["result"]["npz"]
@@ -420,15 +491,20 @@ def shown_result(node):
 
 def sync_rig(node):
     """rebuild the rig's animation if it was made from another result"""
+    d = read_doc(node)
+    sid = node.sessionId()
+    top = rig.stash(node)
+    current = rig.stash_tag(node)
+    made_from = rig._bake_cache.get(sid)
+    reference = made_from[1] if made_from is not None and made_from[0] == current else None
     shown = shown_result(node)
     if node.parm("rig_npz").unexpandedString() != shown:
         with hou.undos.disabler():
             node.parm("rig_npz").set(shown)
-    write_rig_keep(node, read_doc(node))
-    top = rig.stash(node)
+    write_rig_keep(node, d)
     if top is None:
         return False
-    tag, current, damaged = rig.source_tag(node), rig.stash_tag(node), rig.damaged(top)
+    tag, damaged = rig.source_tag(node), rig.damaged(top)
     if current == tag and not damaged:
         return False
     if current is None and not damaged and is_editing(node):
@@ -440,9 +516,11 @@ def sync_rig(node):
                 rig.repair(node, current if current is not None else tag)
                 set_status(node, "The stored poses listed the character as removed; that was repaired.")
             if rig.stash_tag(node) is None:
-                rig.retag(node, tag)
-            elif rig.stash_tag(node) != tag:
-                rig.merge(node, kept_keys(read_doc(node)), tag)
+                rig.retag(node, rig.source_tag(node))
+            if rig.stash_tag(node) != rig.source_tag(node):
+                capture_poses(node, d, reference)
+                rig.merge(node, {}, rig.source_tag(node))
+                _captured.pop(sid, None)
 
     _outside_edit(node, apply)
     return current is not None
@@ -454,11 +532,10 @@ def _outside_edit(node, fn):
     held = sid in _switching
     _switching.add(sid)
     try:
-        if viewer is not None:
-            viewer.enterViewState()
+        leave_state(node)
         fn()
     finally:
-        if viewer is not None:
+        if viewer is not None and viewer.isCurrentTab():
             viewer.setCurrentState(ANIMATE_STATE)
         if not held:
             _switching.discard(sid)
@@ -527,8 +604,14 @@ class _GenerateJob:
         update_auto_constraints(node)
         self.doc = doc_from_parms(node)
         doc.validate(self.doc)
-        self.request = client.make_request(self.doc, constraints_json(node, self.doc))
-        self.applied = applied_key(node, self.doc)
+        stored = capture_poses(node, self.doc)
+        if rig.stash(node) is not None and rig.stash_tag(node) != rig.source_tag(node):
+            with hou.undos.disabler():
+                rig.merge(node, {}, rig.source_tag(node))
+            _captured.pop(node.sessionId(), None)
+        cjson = constraints.to_kimodo_json(self.doc["constraints"], stored.__getitem__)
+        self.request = client.make_request(self.doc, cjson)
+        self.applied = constraints_key(cjson)
         key = client.cache_key(self.request)
         self.paths = [f"{CACHE_DIR}/{key}/sample_{i}.npz" for i in range(self.request["num_samples"])]
         self.request["output_dir"] = os.path.normpath(hou.text.expandString(f"{CACHE_DIR}/{key}"))
@@ -551,6 +634,7 @@ class _GenerateJob:
         }
         with hou.undos.disabler():
             write_doc(self.node, d)
+        embed_results(self.node, self.paths)
         sync_rig(self.node)
         update_unapplied(self.node)
         self.status(text, "done")
@@ -558,7 +642,7 @@ class _GenerateJob:
     def step(self):
         elapsed = time.monotonic() - self.started
         if self.job_id is None:
-            if all(os.path.isfile(hou.text.expandString(p)) for p in self.paths):
+            if all(os.path.isfile(result_file(self.node, p)) for p in self.paths):
                 self.finish("Loaded cached result.")
                 return True
             if self.canceled:
@@ -601,9 +685,7 @@ def generate(node, wait=False, poll=0.25, timeout=600.0):
     if sid in _running:
         set_status(node, "Already generating.")
         return None
-    viewer = editing_viewer(node)
-    if viewer is not None:
-        viewer.enterViewState()
+    leave_state(node)
     clear_error(node)
     try:
         gen = _GenerateJob(node)
@@ -697,11 +779,33 @@ def scene_viewers():
     return [p for p in hou.ui.paneTabs() if p.type() == hou.paneTabType.SceneViewer]
 
 
-def editing_viewer(node):
+def editing_viewers(node):
+    """scene viewers posing this node, shown ones first"""
     if not hou.isUIAvailable():
-        return None
+        return []
     found = [v for v in scene_viewers() if v.currentState() == ANIMATE_STATE and v.currentNode() == node]
-    return next((v for v in found if v.isCurrentTab()), found[0] if found else None)
+    return sorted(found, key=lambda v: not v.isCurrentTab())
+
+
+def editing_viewer(node):
+    return next(iter(editing_viewers(node)), None)
+
+
+def _leave(viewer):
+    pane = viewer.pane()
+    front = None if viewer.isCurrentTab() or pane is None else pane.currentTab()
+    if front is not None:
+        viewer.setIsCurrentTab()
+    try:
+        viewer.enterViewState()
+    finally:
+        if front is not None:
+            front.setIsCurrentTab()
+
+
+def leave_state(node):
+    for viewer in editing_viewers(node):
+        _leave(viewer)
 
 
 def is_editing(node):
@@ -715,6 +819,9 @@ def edit_pose(node):
     viewer = next((v for v in scene_viewers() if v.isCurrentTab() and v.pwd() == node.parent()), None)
     if viewer is None:
         set_status(node, f"Show {node.parent().path()} in a Scene View to edit poses.")
+        return False
+    if not node.isDisplayFlagSet():
+        set_status(node, "Set the display flag on this node to edit poses.")
         return False
     try:
         ensure_stash(node)
@@ -730,9 +837,7 @@ def edit_pose(node):
 
 def end_edit(node):
     """leave posing and show the node's own output again"""
-    viewer = editing_viewer(node)
-    if viewer is not None:
-        viewer.enterViewState()
+    leave_state(node)
     finish_edit(node)
 
 
@@ -754,6 +859,18 @@ def finish_edit(node):
         message = e.instanceMessage() if isinstance(e, hou.Error) else str(e)
         set_status(node, f"Could not read the edited poses: {message}")
     return sid not in _retry
+
+
+INTERRUPTED = "The generation that ran when this scene was saved did not finish. Press Generate."
+
+
+def node_ready(node):
+    """OnCreated / OnLoaded"""
+    if node.evalParm("busy") and node.sessionId() not in _running:
+        set_busy(node, False)
+        with hou.undos.disabler():
+            node.parm("status").set(INTERRUPTED)
+    watch(node)
 
 
 def watch(node):
@@ -829,10 +946,20 @@ def poll(node):
     """one look at a watched node"""
     sid = node.sessionId()
     seen = _watched[sid]
-    viewer = editing_viewer(node)
-    editing, changes = viewer is not None, _changes.get(sid, 0)
     if sid in _switching:
         return
+    viewers = editing_viewers(node)
+    displayed = node.isDisplayFlagSet()
+    for viewer in [v for v in viewers if not displayed or not v.isCurrentTab()]:
+        _leave(viewer)
+        viewers.remove(viewer)
+        set_status(
+            node,
+            "Pose editing ended: "
+            + ("its Scene View tab is no longer shown." if displayed else "the node is no longer displayed."),
+        )
+    viewer = viewers[0] if viewers else None
+    editing, changes = viewer is not None, _changes.get(sid, 0)
     if editing:
         try:
             show_pinned_controls(node, viewer)
@@ -856,7 +983,7 @@ def _motion(path):
 
 def _shown_path(node):
     paths = read_doc(node)["result"]["npz"]
-    return hou.text.expandString(paths[min(max(node.evalParm("sample"), 0), len(paths) - 1)]) if paths else ""
+    return result_file(node, paths[min(max(node.evalParm("sample"), 0), len(paths) - 1)]) if paths else ""
 
 
 def cook(sop):
@@ -908,9 +1035,10 @@ def cook_rig_source(sop):
     """python sop: the motion the rig follows"""
     node = sop.parent()
     frame = int(round(hou.frame())) - 1
-    path = node.evalParm("rig_npz")
+    node.evalParm("rig_npz")
+    path = result_file(node, node.parm("rig_npz").unexpandedString())
     stored = read_poses(node).get(frame)
-    partial = _rig_keep(node.parm("rig_keep").unexpandedString()).get(frame)
+    types = _rig_keep(node.parm("rig_keep").unexpandedString()).get(frame)
     if os.path.isfile(path):
         motion = _motion(path)
         i = min(max(frame, 0), motion.num_frames - 1)
@@ -920,18 +1048,12 @@ def cook_rig_source(sop):
         local, root = motion.local_rots[i], motion.positions[i, 0].astype(np.float64)
     else:
         local, root = np.broadcast_to(np.eye(3), (skeleton.NUM_JOINTS, 3, 3)), skeleton.rest_positions()[0]
-    if stored is not None and stored.local_rots is not None and partial is not None:
-        positions, world = skeleton.pinned_pose(
-            local, stored.local_rots, stored.root_position, {rig.TIPS[ctype] for ctype in partial}
-        )
-        return skeleton.write_geometry(
-            sop.geometry(), positions, np.swapaxes(world, -1, -2).reshape(skeleton.NUM_JOINTS, 9), with_root=True
-        )
     if stored is not None:
-        if stored.local_rots is not None:
-            local = stored.local_rots
-        root = np.where(np.isnan(stored.root_position), root, stored.root_position)
-    positions, world = skeleton.fk(local, root)
+        positions, world = skeleton.composed_pose(
+            local, root, stored.local_rots, stored.root_position, stored.root_2d, types or ()
+        )
+    else:
+        positions, world = skeleton.fk(local, root)
     skeleton.write_geometry(
         sop.geometry(), positions, np.swapaxes(world, -1, -2).reshape(skeleton.NUM_JOINTS, 9), with_root=True
     )

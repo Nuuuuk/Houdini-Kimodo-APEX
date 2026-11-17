@@ -134,9 +134,6 @@ _TARGETS = {
 }
 
 
-TIPS = {"left-hand": "LeftHand", "right-hand": "RightHand", "left-foot": "LeftFoot", "right-foot": "RightFoot"}
-
-
 def _control_channels(control):
     return {f"{control}_{kind}{axis}" for kind in "trs" for axis in "xyz"}
 
