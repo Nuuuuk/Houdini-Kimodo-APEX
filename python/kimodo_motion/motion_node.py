@@ -1,5 +1,7 @@
 """the node side of things: generate, status, stored poses, the cooks."""
 
+import hashlib
+import hashlib
 import json
 import os
 import time
@@ -148,6 +150,28 @@ def constraints_json(node, d):
     return constraints.to_kimodo_json(d["constraints"], pose_source(node, constraint_frames(d)))
 
 
+def constraints_key(cjson):
+    return hashlib.sha256(json.dumps(cjson, sort_keys=True).encode()).hexdigest()[:16]
+
+
+NO_CONSTRAINTS = constraints_key([])
+
+
+def update_unapplied(node):
+    """unapplied: do the constraints differ from the ones the result was made with"""
+    d = read_doc(node)
+    result = d["result"]
+    unapplied = 0
+    if result["npz"]:
+        try:
+            unapplied = int(constraints_key(constraints_json(node, d)) != result.get("applied", NO_CONSTRAINTS))
+        except rig.NotReady:
+            return
+    if node.evalParm("unapplied") != unapplied:
+        with hou.undos.disabler():
+            node.parm("unapplied").set(unapplied)
+
+
 def _new_id(d):
     used = {c["id"] for c in d["constraints"]}
     return next(f"c{n}" for n in range(1, len(used) + 2) if f"c{n}" not in used)
@@ -165,6 +189,7 @@ def add_constraint(node, ctype, frame, auto=False):
         entry["auto"] = True
     d["constraints"].append(entry)
     write_doc(node, d)
+    update_unapplied(node)
     set_status(node, f"{TYPE_LABELS[ctype]} keyframe added at frame {frame + 1}.")
     return entry["id"]
 
@@ -186,6 +211,7 @@ def delete_constraint(node, cid):
             rig.snap(node, freed)
 
     _outside_edit(node, apply)
+    update_unapplied(node)
     set_status(node, f"{TYPE_LABELS[gone[0]['type']]} constraint deleted.")
 
 
@@ -196,6 +222,7 @@ def set_constraint_type(node, cid, ctype):
             c["type"] = ctype
             c.pop("auto", None)
     write_doc(node, d)
+    update_unapplied(node)
     set_status(node, f"Constraint set to {TYPE_LABELS[ctype]}.")
 
 
@@ -213,7 +240,10 @@ def update_auto_constraints(node, only=None):
     """auto constraints follow the edited frames"""
     d = read_doc(node)
     total = doc.total_frames(doc_from_parms(node))
-    edited = {f for f in rig.edited_frames(node, only) if 0 <= f < total}
+    try:
+        edited = {f for f in rig.edited_frames(node, only) if 0 <= f < total}
+    except rig.NotReady:
+        return
     constrained = set(constraint_frames(d))
     added = sorted(edited - constrained)
     removed = [
@@ -228,6 +258,8 @@ def update_auto_constraints(node, only=None):
         d["constraints"].append({"id": _new_id(d), "type": "fullbody", "frames": [f], "auto": True})
     with hou.undos.disabler():
         write_doc(node, d)
+    if not is_editing(node):
+        update_unapplied(node)
     if added:
         set_status(
             node,
@@ -237,8 +269,18 @@ def update_auto_constraints(node, only=None):
         )
 
 
+def shown_result(node):
+    """'<request key>:<sample>' of the shown sample, '' while there is none"""
+    paths = read_doc(node)["result"]["npz"]
+    return paths[min(max(node.evalParm("sample"), 0), len(paths) - 1)] if paths else ""
+
+
 def sync_rig(node):
     """rebuild the rig's animation if it was made from another result"""
+    shown = shown_result(node)
+    if node.parm("rig_npz").unexpandedString() != shown:
+        with hou.undos.disabler():
+            node.parm("rig_npz").set(shown)
     if rig.stash(node) is None:
         return False
     tag, current = rig.source_tag(node), rig.stash_tag(node)
@@ -291,6 +333,7 @@ def import_constraints(node, path):
             node.node(rig.ANIMATE).parm("animation").set(hou.Geometry())
 
     _outside_edit(node, apply)
+    update_unapplied(node)
     set_status(node, f"Imported {len(cons)} constraints from {os.path.basename(path)}.")
 
 
@@ -329,6 +372,7 @@ class _GenerateJob:
         self.doc = doc_from_parms(node)
         doc.validate(self.doc)
         self.request = client.make_request(self.doc, constraints_json(node, self.doc))
+        self.applied = constraints_key(self.request["constraints"])
         key = client.cache_key(self.request)
         self.paths = [f"{CACHE_DIR}/{key}/sample_{i}.npz" for i in range(self.request["num_samples"])]
         self.request["output_dir"] = os.path.normpath(hou.text.expandString(f"{CACHE_DIR}/{key}"))
@@ -344,10 +388,15 @@ class _GenerateJob:
     def finish(self, text):
         d = read_doc(self.node)
         d.update({k: self.doc[k] for k in ("model", "prompts", "generation")})
-        d["result"] = {"npz": self.paths, "selected": min(self.node.evalParm("sample"), len(self.paths) - 1)}
+        d["result"] = {
+            "npz": self.paths,
+            "selected": min(self.node.evalParm("sample"), len(self.paths) - 1),
+            "applied": self.applied,
+        }
         with hou.undos.disabler():
             write_doc(self.node, d)
         sync_rig(self.node)
+        update_unapplied(self.node)
         self.status(text, "done")
 
     def step(self):
@@ -401,7 +450,7 @@ def generate(node, wait=False, poll=0.25, timeout=600.0):
     clear_error(node)
     try:
         gen = _GenerateJob(node)
-    except (hou.Error, doc.DocError, client.ServiceError) as e:
+    except (hou.Error, doc.DocError, client.ServiceError, rig.NotReady) as e:
         message = e.instanceMessage() if isinstance(e, hou.Error) else str(e)
         set_status(node, "Cannot generate.", "error", detail=message)
         return None
@@ -500,10 +549,14 @@ def edit_pose(node):
         set_status(node, "Open a Scene Viewer to edit poses.")
         return False
     inner = node.node(ANIMATE_NODE)
-    if rig.stash(node) is None:
-        with hou.undos.disabler():
-            rig.merge(node, [], rig.source_tag(node))
-    sync_rig(node)
+    try:
+        sync_rig(node)
+        if rig.stash(node) is None:
+            with hou.undos.disabler():
+                rig.merge(node, [], rig.source_tag(node))
+    except rig.NotReady as e:
+        set_status(node, f"The rig is not ready: {e}. Try again.")
+        return False
     if not inner.isDisplayFlagSet():
         set_status(
             node,
@@ -526,6 +579,7 @@ def end_edit(node):
         return
     viewer.setCurrentState("select")
     update_auto_constraints(node)
+    update_unapplied(node)
     viewer.setPwd(node.parent())
     viewer.setPin(_edit_restore.pop(node.sessionId(), False))
     node.setCurrent(True, clear_all_selected=True)
@@ -539,23 +593,38 @@ def _motion(path):
     return cached[1]
 
 
+def _shown_path(node):
+    paths = read_doc(node)["result"]["npz"]
+    return hou.text.expandString(paths[min(max(node.evalParm("sample"), 0), len(paths) - 1)]) if paths else ""
+
+
 def cook(sop):
     """python sop: the shown sample at the current frame"""
-    node = sop.parent()
-    geo = sop.geometry()
     frame = hou.frame()
-    d = read_doc(node)
+    path = _shown_path(sop.parent())
+    if os.path.isfile(path):
+        skeleton.build_geometry(sop.geometry(), _motion(path), int(round(frame)) - 1)
+
+
+UNAPPLIED_WARNING = "Edited poses not applied. Press Generate."
+
+
+def cook_notice(sop):
+    """python sop at the end, raises the asset's warning or error"""
+    node = sop.parent()
     error = node.parm("error").unexpandedString()
-    paths = d["result"]["npz"]
-    path = hou.text.expandString(paths[min(max(node.evalParm("sample"), 0), len(paths) - 1)]) if paths else ""
-    if not os.path.isfile(path):
+    has_output = len(sop.geometry().points()) > 0
+    if node.evalParm("unapplied"):
+        raise hou.NodeWarning(
+            UNAPPLIED_WARNING if not error else f"{UNAPPLIED_WARNING}\nThe last Generate failed.\n{error}"
+        )
+    if not has_output:
         if error:
             raise hou.NodeError(error)
+        path = _shown_path(node)
         if path:
             raise hou.NodeWarning(f"Result file is missing: {path}. Press Generate to recreate it.")
-        return
-    skeleton.build_geometry(geo, _motion(path), int(round(frame)) - 1)
-    if error:
+    elif error:
         raise hou.NodeWarning(f"The last Generate failed; this is the previous result.\n{error}")
 
 
@@ -568,9 +637,7 @@ def cook_rig_source(sop):
     """python sop: the motion the rig follows"""
     node = sop.parent()
     frame = int(round(hou.frame())) - 1
-    d = read_doc(node)
-    paths = d["result"]["npz"]
-    path = hou.text.expandString(paths[min(max(node.evalParm("sample"), 0), len(paths) - 1)]) if paths else ""
+    path = node.evalParm("rig_npz")
     stored = read_poses(node).get(frame)
     if os.path.isfile(path):
         motion = _motion(path)
@@ -586,3 +653,14 @@ def cook_rig_source(sop):
         root = np.where(np.isnan(stored.root_position), root, stored.root_position)
     positions, world = skeleton.fk(local, root)
     skeleton.write_geometry(sop.geometry(), positions, np.swapaxes(world, -1, -2).reshape(skeleton.NUM_JOINTS, 9))
+
+
+def cook_rig_output(sop):
+    """python sop: the rig's pose, shown while constraints are unapplied"""
+    source = sop.inputGeometry(0)
+    geo = sop.geometry()
+    geo.clear()
+    if source is not None and len(source.points()):
+        pose = rig.pose_from_geometry(source)
+        positions, world = skeleton.fk(pose.local_rots, pose.root_position)
+        skeleton.write_geometry(geo, positions, np.swapaxes(world, -1, -2).reshape(skeleton.NUM_JOINTS, 9))
