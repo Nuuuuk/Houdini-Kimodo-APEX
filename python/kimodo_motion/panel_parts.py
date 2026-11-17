@@ -8,6 +8,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from . import doc, motion_node
 
 TRACKS = ("Prompts", "Full-Body", "2D Root", "Left Hand", "Right Hand", "Left Foot", "Right Foot")
+TRACK_TYPES = ("fullbody", "root2d", "left-hand", "right-hand", "left-foot", "right-foot")
 WIDE_ASPECT = 2.2
 
 STAGE_COLORS = {
@@ -68,19 +69,60 @@ class TrackLabels(FontSized):
 
 
 class TimelineCanvas(FontSized):
+    add_requested = QtCore.Signal(str)
+    delete_requested = QtCore.Signal(str)
+    type_requested = QtCore.Signal(str, str)
+    frame_requested = QtCore.Signal(int)
+
     def __init__(self):
-        self.prompts, self.total, self.frame = [], 5 * doc.FPS, 0
+        self.prompts, self.constraints, self.total, self.frame = [], [], 5 * doc.FPS, 0
         super().__init__()
+
+    def scale(self):
+        return max(self.width() / max(self.total, 1), self.m.px_per_frame)
+
+    def constraint_at(self, pos):
+        row = (pos.y() - self.m.ruler_h) // self.m.row_h - 1
+        if not 0 <= row < len(TRACK_TYPES):
+            return None, None
+        ctype, scale = TRACK_TYPES[row], self.scale()
+        reach = max(self.m.row_h // 2, 6)
+        for c in self.constraints:
+            if c["type"] == ctype and any(abs(pos.x() - (f + 0.5) * scale) <= reach for f in c["frames"]):
+                return c, ctype
+        return None, ctype
+
+    def mousePressEvent(self, event):
+        c, ctype = self.constraint_at(event.position().toPoint())
+        if ctype is None:
+            return super().mousePressEvent(event)
+        if event.button() == QtCore.Qt.RightButton and c is not None:
+            menu = QtWidgets.QMenu(self)
+            delete = menu.addAction("Delete")
+            types = menu.addMenu("Change Type")
+            actions = {types.addAction(TRACKS[i + 1]): t for i, t in enumerate(TRACK_TYPES) if t != c["type"]}
+            chosen = menu.exec(event.globalPosition().toPoint())
+            if chosen is delete:
+                self.delete_requested.emit(c["id"])
+            elif chosen in actions:
+                self.type_requested.emit(c["id"], actions[chosen])
+        elif event.button() == QtCore.Qt.LeftButton:
+            if c is not None:
+                x = event.position().x() / self.scale() - 0.5
+                self.frame_requested.emit(min(c["frames"], key=lambda f: abs(f - x)))
+            else:
+                self.add_requested.emit(ctype)
 
     def apply_metrics(self):
         super().apply_metrics()
         self.setFixedHeight(self.m.tracks_h)
         self.setMinimumWidth(self.total * self.m.px_per_frame)
 
-    def set_state(self, prompts, frame):
+    def set_state(self, prompts, frame, constraints=()):
         total = prompts[-1]["end_frame"] if prompts else 5 * doc.FPS
-        if (prompts, frame, total) != (self.prompts, self.frame, self.total):
-            self.prompts, self.frame, self.total = prompts, frame, total
+        constraints = list(constraints)
+        if (prompts, frame, total, constraints) != (self.prompts, self.frame, self.total, self.constraints):
+            self.prompts, self.frame, self.total, self.constraints = prompts, frame, total, constraints
             self.setMinimumWidth(total * self.m.px_per_frame)
             self.update()
 
@@ -88,7 +130,7 @@ class TimelineCanvas(FontSized):
         p = QtGui.QPainter(self)
         pal = self.palette()
         ruler_h, row_h = self.m.ruler_h, self.m.row_h
-        scale = max(self.width() / max(self.total, 1), self.m.px_per_frame)
+        scale = self.scale()
         text = pal.color(QtGui.QPalette.Text)
         for i in range(len(TRACKS)):
             role = QtGui.QPalette.AlternateBase if i % 2 else QtGui.QPalette.Base
@@ -105,6 +147,30 @@ class TimelineCanvas(FontSized):
             p.setPen(QtGui.QColor(255, 255, 255))
             label = p.fontMetrics().elidedText(pr["text"], QtCore.Qt.ElideRight, rect.width() - 8)
             p.drawText(rect.adjusted(4, 0, -4, 0), QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter, label)
+        p.setRenderHint(QtGui.QPainter.Antialiasing)
+        size = max(row_h // 2 - 2, 4)
+        for c in self.constraints:
+            y = ruler_h + (TRACK_TYPES.index(c["type"]) + 1) * row_h + row_h // 2
+            frames = c["frames"]
+            color = QtGui.QColor(240, 170, 60) if not c.get("auto") else QtGui.QColor(240, 210, 130)
+            p.setPen(QtCore.Qt.NoPen)
+            p.setBrush(color)
+            if len(frames) > 1 and frames[-1] - frames[0] == len(frames) - 1:
+                p.drawRoundedRect(QtCore.QRectF(frames[0] * scale, y - size / 2, (len(frames)) * scale, size), 2, 2)
+                continue
+            for f in frames:
+                cx = (f + 0.5) * scale
+                p.drawPolygon(
+                    QtGui.QPolygonF(
+                        [
+                            QtCore.QPointF(cx, y - size),
+                            QtCore.QPointF(cx + size, y),
+                            QtCore.QPointF(cx, y + size),
+                            QtCore.QPointF(cx - size, y),
+                        ]
+                    )
+                )
+        p.setRenderHint(QtGui.QPainter.Antialiasing, False)
         x = int(self.frame * scale)
         p.setPen(QtGui.QPen(QtGui.QColor(230, 90, 60), 2))
         p.drawLine(x, 0, x, self.height())
@@ -219,6 +285,13 @@ class KimodoPanel(QtWidgets.QWidget):
         self.parm_editor = None
         self.parm_editor_factory = parm_editor_factory or (lambda node: hou.qt.ParmDialog(node, compact=True))
         self.timeline = TimelineArea()
+        canvas = self.timeline.canvas
+        canvas.add_requested.connect(
+            lambda ctype: self.with_node(motion_node.add_constraint, ctype, int(round(hou.frame())) - 1)
+        )
+        canvas.delete_requested.connect(lambda cid: self.with_node(motion_node.delete_constraint, cid))
+        canvas.type_requested.connect(lambda cid, ctype: self.with_node(motion_node.set_constraint_type, cid, ctype))
+        canvas.frame_requested.connect(lambda frame: hou.setFrame(frame + 1))
         self.status = StatusWidget()
         self.status.dismissed.connect(self.dismiss_error)
         self.lower = QtWidgets.QWidget()
@@ -272,10 +345,23 @@ class KimodoPanel(QtWidgets.QWidget):
             editing = motion_node.is_editing(self.node)
             self.edit_button.setEnabled(not editing)
             self.done_button.setEnabled(editing)
-            prompts = motion_node.read_doc(self.node)["prompts"]
-            self.timeline.canvas.set_state(prompts, int(round(hou.frame())) - 1)
+            frame = int(round(hou.frame())) - 1
+            if not self.node.evalParm("busy"):
+                motion_node.sync_rig(self.node)
+            if editing:
+                motion_node.update_auto_constraints(self.node, only=[frame])
+            d = motion_node.read_doc(self.node)
+            self.timeline.canvas.set_state(d["prompts"], frame, d["constraints"])
         except (hou.ObjectWasDeleted, doc.DocError):
             self.node = None
+
+    def with_node(self, fn, *args):
+        if self.node is not None:
+            try:
+                fn(self.node, *args)
+            except hou.Error as e:
+                motion_node.set_status(self.node, e.instanceMessage())
+            self.refresh()
 
     def edit_pose(self):
         if self.node is not None:
