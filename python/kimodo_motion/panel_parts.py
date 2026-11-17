@@ -9,6 +9,7 @@ from . import doc, motion_node, rig
 
 TRACKS = ("Prompts", "Full-Body", "2D Root", "Left Hand", "Right Hand", "Left Foot", "Right Foot")
 TRACK_TYPES = ("fullbody", "root2d", "left-hand", "right-hand", "left-foot", "right-foot")
+POSE_HINT = "Enter in the viewer also edits; Esc exits."
 WIDE_ASPECT = 2.2
 
 STAGE_COLORS = {
@@ -73,6 +74,9 @@ class TimelineCanvas(FontSized):
     delete_requested = QtCore.Signal(str)
     type_requested = QtCore.Signal(str, str)
     frame_requested = QtCore.Signal(int)
+    edit_requested = QtCore.Signal()
+    copy_requested = QtCore.Signal(int)
+    paste_requested = QtCore.Signal(str, bool)
 
     def __init__(self):
         self.prompts, self.constraints, self.total, self.frame = [], [], 5 * doc.FPS, 0
@@ -96,28 +100,55 @@ class TimelineCanvas(FontSized):
                 return c, ctype
         return None, ctype
 
+    def track_menu(self, constraint, ctype, frame):
+        menu, actions = QtWidgets.QMenu(self), {}
+        if constraint is not None:
+            actions[menu.addAction("Copy Pose")] = lambda: self.copy_requested.emit(frame)
+        label = f"Paste Pose at Frame {self.frame + 1}"
+        pastes = [(label, False)]
+        if ctype in ("fullbody", "root2d"):
+            pastes.append((f"{label}, Keep Its Root Position", True))
+        for text, keep_root in pastes:
+            action = menu.addAction(text)
+            action.setEnabled(motion_node.has_copied_pose())
+            actions[action] = lambda keep_root=keep_root: self.paste_requested.emit(ctype, keep_root)
+        if constraint is not None:
+            menu.addSeparator()
+            actions[menu.addAction("Delete")] = lambda: self.delete_requested.emit(constraint["id"])
+            menu.addSeparator()
+            for i, t in enumerate(TRACK_TYPES):
+                if t != constraint["type"]:
+                    actions[menu.addAction(f"Change to {TRACKS[i + 1]}")] = lambda t=t: self.type_requested.emit(
+                        constraint["id"], t
+                    )
+        return menu, actions
+
+    def nearest_frame(self, constraint, event):
+        x = event.position().x() / self.scale() - 0.5
+        return min(constraint["frames"], key=lambda f: abs(f - x))
+
     def mousePressEvent(self, event):
         c, ctype = self.constraint_at(event.position().toPoint())
         if ctype is None:
             return super().mousePressEvent(event)
-        if event.button() == QtCore.Qt.RightButton and c is not None:
-            menu = QtWidgets.QMenu(self)
-            delete = menu.addAction("Delete")
-            menu.addSeparator()
-            actions = {
-                menu.addAction(f"Change to {TRACKS[i + 1]}"): t for i, t in enumerate(TRACK_TYPES) if t != c["type"]
-            }
+        if event.button() == QtCore.Qt.RightButton:
+            menu, actions = self.track_menu(c, ctype, self.nearest_frame(c, event) if c is not None else None)
             chosen = menu.exec(event.globalPosition().toPoint())
-            if chosen is delete:
-                self.delete_requested.emit(c["id"])
-            elif chosen in actions:
-                self.type_requested.emit(c["id"], actions[chosen])
+            if chosen in actions:
+                actions[chosen]()
         elif event.button() == QtCore.Qt.LeftButton:
             if c is not None:
-                x = event.position().x() / self.scale() - 0.5
-                self.frame_requested.emit(min(c["frames"], key=lambda f: abs(f - x)))
+                self.frame_requested.emit(self.nearest_frame(c, event))
             else:
                 self.add_requested.emit(ctype)
+
+    def mouseDoubleClickEvent(self, event):
+        c, _ = self.constraint_at(event.position().toPoint())
+        if c is not None and event.button() == QtCore.Qt.LeftButton:
+            self.frame_requested.emit(self.nearest_frame(c, event))
+            self.edit_requested.emit()
+        else:
+            super().mouseDoubleClickEvent(event)
 
     def apply_metrics(self):
         super().apply_metrics()
@@ -289,7 +320,6 @@ class KimodoPanel(QtWidgets.QWidget):
         super().__init__()
         self.node = None
         self.refreshing = False
-        self.seen_constraints = None
         self.parm_editor = None
         self.parm_editor_factory = parm_editor_factory or (lambda node: hou.qt.ParmDialog(node, compact=True))
         self.timeline = TimelineArea()
@@ -300,6 +330,13 @@ class KimodoPanel(QtWidgets.QWidget):
         canvas.delete_requested.connect(lambda cid: self.with_node(motion_node.delete_constraint, cid))
         canvas.type_requested.connect(lambda cid, ctype: self.with_node(motion_node.set_constraint_type, cid, ctype))
         canvas.frame_requested.connect(lambda frame: hou.setFrame(frame + 1))
+        canvas.edit_requested.connect(self.edit_pose)
+        canvas.copy_requested.connect(lambda frame: self.with_node(motion_node.copy_pose, frame))
+        canvas.paste_requested.connect(
+            lambda ctype, keep_root: self.with_node(
+                motion_node.paste_pose, ctype, int(round(hou.frame())) - 1, keep_root
+            )
+        )
         self.status = StatusWidget()
         self.status.dismissed.connect(self.dismiss_error)
         self.lower = QtWidgets.QWidget()
@@ -308,10 +345,11 @@ class KimodoPanel(QtWidgets.QWidget):
         self.lower_layout.setSpacing(4)
         self.lower_layout.addWidget(self.status, 0)
         self.edit_button = QtWidgets.QPushButton("Edit Pose")
+        self.edit_button.setCheckable(True)
         self.edit_button.setToolTip("Pose the rig in the viewport at the current frame (APEX animate state).")
         self.edit_button.clicked.connect(self.edit_pose)
         self.done_button = QtWidgets.QPushButton("Done")
-        self.done_button.setToolTip("Leave pose editing and show the generated motion again.")
+        self.done_button.setToolTip("Leave pose editing.")
         self.done_button.clicked.connect(self.end_edit)
         pose_row = QtWidgets.QHBoxLayout()
         pose_row.addWidget(self.edit_button)
@@ -319,6 +357,10 @@ class KimodoPanel(QtWidgets.QWidget):
         pose_row.addStretch(1)
         self.lower_layout.addLayout(pose_row, 0)
         self.lower_layout.addStretch(1)
+        self.pose_hint = QtWidgets.QLabel(POSE_HINT)
+        self.pose_hint.setWordWrap(True)
+        self.pose_hint.setEnabled(False)
+        self.lower_layout.insertWidget(2, self.pose_hint, 0)
         self.splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
         self.splitter.addWidget(self.timeline)
         self.splitter.addWidget(self.lower)
@@ -338,15 +380,16 @@ class KimodoPanel(QtWidgets.QWidget):
         if node is not None:
             if self.parm_editor is None:
                 self.parm_editor = self.parm_editor_factory(node)
-                self.lower_layout.takeAt(2)
+                self.lower_layout.takeAt(3)
                 self.lower_layout.addWidget(self.parm_editor, 1)
             else:
                 self.parm_editor.setNode(node)
+            motion_node.watch(node)
         self.refresh()
 
     def refresh(self):
         """cheap, runs five times a second"""
-        if self.refreshing:
+        if self.refreshing or not self.isVisible():
             return
         self.refreshing = True
         try:
@@ -354,22 +397,16 @@ class KimodoPanel(QtWidgets.QWidget):
                 return
             self.status.show_status(motion_node.get_status(self.node))
             editing = motion_node.is_editing(self.node)
-            self.edit_button.setEnabled(not editing)
+            self.edit_button.setChecked(editing)
             self.done_button.setEnabled(editing)
-            frame = int(round(hou.frame())) - 1
-            if not self.node.evalParm("busy"):
-                motion_node.sync_rig(self.node)
-            if editing:
-                motion_node.update_auto_constraints(self.node, only=[frame])
             d = motion_node.read_doc(self.node)
-            if not editing and d["constraints"] != self.seen_constraints:
-                self.seen_constraints = d["constraints"]
-                motion_node.update_unapplied(self.node)
+            frame = int(round(hou.frame())) - 1
+            self.pose_hint.setText(
+                motion_node.pinned_note(d, frame) if editing and motion_node.pinned_note(d, frame) else POSE_HINT
+            )
             self.timeline.canvas.set_state(d["prompts"], frame, d["constraints"])
         except (hou.ObjectWasDeleted, doc.DocError):
             self.node = None
-        except rig.NotReady:
-            pass
         finally:
             self.refreshing = False
 
@@ -379,6 +416,8 @@ class KimodoPanel(QtWidgets.QWidget):
                 fn(self.node, *args)
             except hou.Error as e:
                 motion_node.set_status(self.node, e.instanceMessage())
+            except rig.NotReady as e:
+                motion_node.set_status(self.node, f"The rig is not ready: {e}. Try again.")
             self.refresh()
 
     def edit_pose(self):

@@ -7,8 +7,10 @@ import numpy as np
 
 from . import constraints, doc, skeleton
 
-SOURCE, BAKE, ANIMATE, POSE = "rig_source", "motion_on_rig", "animate", "rig_pose"
+SOURCE, BAKE, ANIMATE, POSE, BAKE_POSE = "rig_source", "motion_on_rig", "animate", "rig_pose", "bake_pose"
+STASH = "animation"
 TAG = "kimodo_source"
+REMOVED = "removed_paths"
 EPS = 1e-5
 _PARENTS = np.array(skeleton.PARENTS)
 _PICKS = (lambda n: n == "animation", lambda n: n.endswith(".clip"), lambda n: n != "layer.data")
@@ -44,7 +46,7 @@ def _edited_copy(top, edit):
 
 def stash(node):
     """the animation stored on the animate node, None until there is one"""
-    geo = node.node(ANIMATE).parm("animation").eval()
+    geo = node.parm(STASH).eval()
     if geo is None or not any(p.attribValue("name") == "animation" for p in geo.prims()):
         return None
     return geo
@@ -60,7 +62,7 @@ def bake(node):
     if cached is not None and cached[0] == tag:
         return cached[1]
     if sid in _baking:
-        raise NotReady("the rig's animation is being baked")
+        raise NotReady("the rig is being evaluated")
     _baking.add(sid)
     try:
         geo = node.node(BAKE).geometry()
@@ -82,7 +84,7 @@ def bake(node):
 
 def source_tag(node):
     """what the rig should follow now"""
-    poses = node.parm("kimodo_poses").unexpandedString()
+    poses = node.parm("kimodo_poses").unexpandedString() + node.parm("rig_keep").unexpandedString()
     return (
         f"{node.parm('rig_npz').unexpandedString()}|{node.evalParm('duration'):g}|"
         f"{hashlib.md5(poses.encode()).hexdigest()[:12]}"
@@ -93,7 +95,7 @@ def _set_stash(node, top, tag):
     if top.findGlobalAttrib(TAG) is None:
         top.addAttrib(hou.attribType.Global, TAG, "")
     top.setGlobalAttribValue(TAG, tag)
-    node.node(ANIMATE).parm("animation").set(top)
+    node.parm(STASH).set(top)
 
 
 def retag(node, tag):
@@ -107,54 +109,152 @@ def stash_tag(node):
     return top.attribValue(TAG)
 
 
-def merge(node, keep_frames, tag):
+def damaged(top):
+    """the stash lists removed scene paths, can't be evaluated"""
+    return top.findGlobalAttrib(REMOVED) is not None and len(top.attribValue(REMOVED)) > 0
+
+
+def repair(node, tag):
+    """drop a damaged stash's list of removed paths"""
+    top = hou.Geometry(stash(node))
+    try:
+        channels(top)
+    except NotReady:
+        node.parm(STASH).set(hou.Geometry())
+        return merge(node, [], tag)
+    top.findGlobalAttrib(REMOVED).destroy()
+    _set_stash(node, top, tag)
+
+
+_TARGETS = {
+    "left-hand": "L_armTarget_ik",
+    "right-hand": "R_armTarget_ik",
+    "left-foot": "L_legTarget_ik",
+    "right-foot": "R_legTarget_ik",
+}
+
+
+TIPS = {"left-hand": "LeftHand", "right-hand": "RightHand", "left-foot": "LeftFoot", "right-foot": "RightFoot"}
+
+
+def _control_channels(control):
+    return {f"{control}_{kind}{axis}" for kind in "trs" for axis in "xyz"}
+
+
+def pinned_controls(ctypes):
+    """controls these constraint types pin, None for all"""
+    if "fullbody" in ctypes:
+        return None
+    names = set()
+    for ctype in ctypes:
+        names |= ({skeleton.ROOT_CONTROL} if ctype == "root2d" else {_TARGETS[ctype], skeleton.ROOT_CONTROL, skeleton.COG_CONTROL})
+    return names
+
+
+def kept_channels(ctypes):
+    controls = pinned_controls(ctypes)
+    if controls is None:
+        return None
+    if controls == {skeleton.ROOT_CONTROL}:
+        return {f"{skeleton.ROOT_CONTROL}_tx", f"{skeleton.ROOT_CONTROL}_tz"}
+    return set().union(*(_control_channels(control) for control in controls))
+
+
+def pasted_channels(ctype, keep_root=False):
+    """channels a pasted pose sets, None for all"""
+    root = {f"{skeleton.ROOT_CONTROL}_t{axis}" for axis in "xyz"}
+    if ctype == "fullbody":
+        return ("all but", root) if keep_root else None
+    if ctype == "root2d":
+        return set() if keep_root else {f"{skeleton.ROOT_CONTROL}_tx", f"{skeleton.ROOT_CONTROL}_tz"}
+    return _control_channels(_TARGETS[ctype])
+
+
+def keys_at(node, frame):
+    return {name: prim.eval(float(frame + 1)) for name, prim in channels(stash(node)).items()}
+
+
+def set_keys(node, frame, values):
+    old = stash(node)
+    f = float(frame + 1)
+
+    def write(geo):
+        for prim in geo.prims():
+            name = prim.attribValue("name")
+            if name in values and prim.hasKeyAtFrame(f):
+                prim.setKeyValue(f, values[name])
+
+    tag = old.attribValue(TAG) if old.findGlobalAttrib(TAG) is not None else ""
+    _set_stash(node, _edited_copy(old, write), tag)
+
+
+CONTROLS_PATH = "/soma.char/Base.rig/"
+
+
+def pose_controls():
+    limbs = [f"{limb}{part}_ik" for limb in skeleton.LIMBS for part in ("Target", "Polevec")]
+    return {skeleton.ROOT_CONTROL, skeleton.COG_CONTROL, *skeleton.FK_CONTROLS, *limbs}
+
+
+def merge(node, keep, tag):
     """rebuild the stash from the bake, keeping its own keys on keep_frames"""
+    keep = keep if isinstance(keep, dict) else dict.fromkeys(keep)
     old = stash(node)
     new = hou.Geometry(bake(node))
-    if old is not None and keep_frames:
+    if old is not None and keep:
         old_channels = channels(old)
-        frames = [float(f + 1) for f in keep_frames]
 
-        def keep(geo):
+        def copy_kept(geo):
             for prim in geo.prims():
-                source = old_channels.get(prim.attribValue("name"))
+                name = prim.attribValue("name")
+                source = old_channels.get(name)
                 if source is None:
                     continue
-                for f in frames:
-                    if source.hasKeyAtFrame(f) and prim.hasKeyAtFrame(f):
+                for frame, names in keep.items():
+                    f = float(frame + 1)
+                    if (names is None or name in names) and source.hasKeyAtFrame(f) and prim.hasKeyAtFrame(f):
                         prim.setKeyValue(f, source.keyValue(f))
 
-        new = _edited_copy(new, keep)
+        new = _edited_copy(new, copy_kept)
     _set_stash(node, new, tag)
 
 
-def snap(node, frames):
+def snap(node, frames, keep=None):
     """the bake's keys back on these frames"""
     old = stash(node)
+    keep = keep or {}
+    frames = [f for f in frames if not (f in keep and keep[f] is None)]
     if old is None or not frames:
-        return
+        return False
     baked = channels(bake(node))
-    wanted = [float(f + 1) for f in frames]
+    changed = []
 
     def reset(geo):
         for prim in geo.prims():
-            source = baked.get(prim.attribValue("name"))
+            name = prim.attribValue("name")
+            source = baked.get(name)
             if source is None:
                 continue
-            for f in wanted:
-                if source.hasKeyAtFrame(f) and prim.hasKeyAtFrame(f):
+            for frame in frames:
+                f = float(frame + 1)
+                if (
+                    name not in keep.get(frame, ())
+                    and source.hasKeyAtFrame(f)
+                    and prim.hasKeyAtFrame(f)
+                    and prim.keyValue(f) != source.keyValue(f)
+                ):
                     prim.setKeyValue(f, source.keyValue(f))
+                    changed.append(name)
 
     tag = old.attribValue(TAG) if old.findGlobalAttrib(TAG) is not None else ""
-    _set_stash(node, _edited_copy(old, reset), tag)
+    new = _edited_copy(old, reset)
+    if changed:
+        _set_stash(node, new, tag)
+    return bool(changed)
 
 
-def edited_frames(node, only=None):
-    top = stash(node)
-    if top is None:
-        return []
-    mine, baked = channels(top), channels(bake(node))
-    edited = set()
+def _differing_frames(mine, baked, only=None):
+    differing = set()
     if only is not None:
         for f in only:
             hf = float(f + 1)
@@ -166,9 +266,9 @@ def edited_frames(node, only=None):
                     and other.hasKeyAtFrame(hf)
                     and abs(prim.keyValue(hf) - other.keyValue(hf)) > EPS
                 ):
-                    edited.add(f)
+                    differing.add(f)
                     break
-        return sorted(edited)
+        return differing
     for name, prim in mine.items():
         other = baked.get(name)
         if other is None:
@@ -176,24 +276,63 @@ def edited_frames(node, only=None):
         frames, other_frames = prim.keyFrames(), other.keyFrames()
         if frames == other_frames:
             diff = np.abs(np.array(prim.keyValues()) - np.array(other.keyValues())) > EPS
-            edited.update(int(round(frames[i])) - 1 for i in np.nonzero(diff)[0])
+            differing.update(int(round(frames[i])) - 1 for i in np.nonzero(diff)[0])
         else:
             for hf in range(
                 int(round(min(frames[0], other_frames[0]))), int(round(max(frames[-1], other_frames[-1]))) + 1
             ):
                 if abs(prim.eval(float(hf)) - other.eval(float(hf))) > EPS:
-                    edited.add(hf - 1)
-    return sorted(edited)
+                    differing.add(hf - 1)
+    return differing
+
+
+_edit_cache = {}
+
+
+def edited_frames(node, only=None):
+    top = stash(node)
+    if top is None:
+        return []
+    mine, baked = channels(top), channels(bake(node))
+    sid, tag = node.sessionId(), source_tag(node)
+    if _edit_cache.get(sid, (None,))[0] != tag:
+        _edit_cache[sid] = (tag, {})
+    known = _edit_cache[sid][1]
+    edited = []
+    for f in sorted(_differing_frames(mine, baked, only)):
+        values = np.array([prim.eval(float(f + 1)) for prim in mine.values()]).tobytes()
+        if f not in known or known[f][0] != values:
+            known[f] = (values, not constraints.same_pose(pose(node, f), bake_pose(node, f)))
+        if known[f][1]:
+            edited.append(f)
+    return edited
+
+
+def _evaluate(node, name, frame):
+    sid = node.sessionId()
+    if sid in _baking:
+        raise NotReady("the rig is being evaluated")
+    _baking.add(sid)
+    try:
+        geo = node.node(name).geometryAtFrame(frame + 1)
+    finally:
+        _baking.discard(sid)
+    if geo is None or not len(geo.points()):
+        errors = "; ".join(node.node(name).errors())
+        # houdini is cooking the rig for the viewport right now
+        if "recursion" in errors.lower():
+            raise NotReady("the rig is being evaluated")
+        raise hou.Error(f"The rig has no pose at frame {frame + 1}: {errors or 'empty output'}")
+    return pose_from_geometry(geo)
 
 
 def pose(node, frame):
     """the rig's pose at a kimodo frame"""
-    geo = node.node(POSE).geometryAtFrame(frame + 1)
-    if geo is None or not len(geo.points()):
-        raise hou.Error(
-            f"The rig has no pose at frame {frame + 1}: {'; '.join(node.node(POSE).errors()) or 'empty output'}"
-        )
-    return pose_from_geometry(geo)
+    return _evaluate(node, POSE, frame)
+
+
+def bake_pose(node, frame):
+    return _evaluate(node, BAKE_POSE, frame)
 
 
 def pose_from_geometry(geo):

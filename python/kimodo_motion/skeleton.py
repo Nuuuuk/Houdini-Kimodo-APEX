@@ -221,6 +221,26 @@ def fk(local_rots, root_position):
     return positions, world
 
 
+def pinned_pose(base_local, stored_local, stored_root, tips):
+    """base pose with only what hand and foot constraints pin from the stored pose"""
+    local = np.array(base_local, dtype=np.float64)
+    local[0] = stored_local[0]
+    positions, world = fk(local, stored_root)
+    stored_positions, stored_world = fk(stored_local, stored_root)
+    rest = rest_positions()
+    moved = set()
+    for j in range(1, NUM_JOINTS):
+        p = PARENTS[j]
+        if JOINT_NAMES[j] in tips:
+            positions[j], world[j] = stored_positions[j], stored_world[j]
+            moved.add(j)
+        elif p in moved:
+            world[j] = world[p] @ local[j]
+            positions[j] = positions[p] + world[p] @ (rest[j] - rest[p])
+            moved.add(j)
+    return positions, world
+
+
 def write_geometry(geo, positions, transform, with_root=False, tags=None):
     """kinefx skeleton from joint positions and transforms"""
     import hou
