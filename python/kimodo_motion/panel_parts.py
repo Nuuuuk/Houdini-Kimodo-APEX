@@ -5,7 +5,7 @@ import time
 import hou
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from . import doc, motion_node
+from . import doc, motion_node, rig
 
 TRACKS = ("Prompts", "Full-Body", "2D Root", "Left Hand", "Right Hand", "Left Foot", "Right Foot")
 TRACK_TYPES = ("fullbody", "root2d", "left-hand", "right-hand", "left-foot", "right-foot")
@@ -81,14 +81,18 @@ class TimelineCanvas(FontSized):
     def scale(self):
         return max(self.width() / max(self.total, 1), self.m.px_per_frame)
 
+    def frame_x(self, frame):
+        """middle of the frame's cell"""
+        return (frame + 0.5) * self.scale()
+
     def constraint_at(self, pos):
         row = (pos.y() - self.m.ruler_h) // self.m.row_h - 1
         if not 0 <= row < len(TRACK_TYPES):
             return None, None
-        ctype, scale = TRACK_TYPES[row], self.scale()
+        ctype = TRACK_TYPES[row]
         reach = max(self.m.row_h // 2, 6)
         for c in self.constraints:
-            if c["type"] == ctype and any(abs(pos.x() - (f + 0.5) * scale) <= reach for f in c["frames"]):
+            if c["type"] == ctype and any(abs(pos.x() - self.frame_x(f)) <= reach for f in c["frames"]):
                 return c, ctype
         return None, ctype
 
@@ -137,7 +141,7 @@ class TimelineCanvas(FontSized):
             p.fillRect(0, ruler_h + i * row_h, self.width(), row_h - 1, pal.color(role))
         p.setPen(text)
         for second in range(self.total // doc.FPS + 1):
-            x = int(second * doc.FPS * scale)
+            x = int(self.frame_x(second * doc.FPS))
             p.drawLine(x, ruler_h - 6, x, ruler_h - 1)
             p.drawText(x + 3, ruler_h - 6, f"{second}s")
         for pr in self.prompts:
@@ -159,7 +163,7 @@ class TimelineCanvas(FontSized):
                 p.drawRoundedRect(QtCore.QRectF(frames[0] * scale, y - size / 2, (len(frames)) * scale, size), 2, 2)
                 continue
             for f in frames:
-                cx = (f + 0.5) * scale
+                cx = self.frame_x(f)
                 p.drawPolygon(
                     QtGui.QPolygonF(
                         [
@@ -171,7 +175,7 @@ class TimelineCanvas(FontSized):
                     )
                 )
         p.setRenderHint(QtGui.QPainter.Antialiasing, False)
-        x = int(self.frame * scale)
+        x = int(self.frame_x(self.frame))
         p.setPen(QtGui.QPen(QtGui.QColor(230, 90, 60), 2))
         p.drawLine(x, 0, x, self.height())
         p.end()
@@ -282,6 +286,8 @@ class KimodoPanel(QtWidgets.QWidget):
     def __init__(self, parm_editor_factory=None):
         super().__init__()
         self.node = None
+        self.refreshing = False
+        self.seen_constraints = None
         self.parm_editor = None
         self.parm_editor_factory = parm_editor_factory or (lambda node: hou.qt.ParmDialog(node, compact=True))
         self.timeline = TimelineArea()
@@ -338,6 +344,9 @@ class KimodoPanel(QtWidgets.QWidget):
 
     def refresh(self):
         """cheap, runs five times a second"""
+        if self.refreshing:
+            return
+        self.refreshing = True
         try:
             if self.node is None:
                 return
@@ -351,9 +360,16 @@ class KimodoPanel(QtWidgets.QWidget):
             if editing:
                 motion_node.update_auto_constraints(self.node, only=[frame])
             d = motion_node.read_doc(self.node)
+            if not editing and d["constraints"] != self.seen_constraints:
+                self.seen_constraints = d["constraints"]
+                motion_node.update_unapplied(self.node)
             self.timeline.canvas.set_state(d["prompts"], frame, d["constraints"])
         except (hou.ObjectWasDeleted, doc.DocError):
             self.node = None
+        except rig.NotReady:
+            pass
+        finally:
+            self.refreshing = False
 
     def with_node(self, fn, *args):
         if self.node is not None:

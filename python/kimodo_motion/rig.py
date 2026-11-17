@@ -14,8 +14,15 @@ _PARENTS = np.array(skeleton.PARENTS)
 _PICKS = (lambda n: n == "animation", lambda n: n.endswith(".clip"), lambda n: n != "layer.data")
 
 
+class NotReady(Exception):
+    """the bake is cooking or incomplete, ask again later"""
+
+
 def _prim(geo, pick):
-    return next(p for p in geo.prims() if pick(p.attribValue("name")))
+    for p in geo.prims():
+        if pick(p.attribValue("name")):
+            return p
+    raise NotReady("the rig's animation is not there (yet)")
 
 
 def channels(top):
@@ -43,19 +50,43 @@ def stash(node):
     return geo
 
 
+_baking = set()
+_bake_cache = {}
+
+
 def bake(node):
-    top = hou.Geometry(node.node(BAKE).geometry())
+    sid, tag = node.sessionId(), source_tag(node)
+    cached = _bake_cache.get(sid)
+    if cached is not None and cached[0] == tag:
+        return cached[1]
+    if sid in _baking:
+        raise NotReady("the rig's animation is being baked")
+    _baking.add(sid)
+    try:
+        geo = node.node(BAKE).geometry()
+    except hou.OperationFailed as e:
+        raise NotReady(f"the bake failed: {e}") from None
+    finally:
+        _baking.discard(sid)
+    if geo is None:
+        raise NotReady("the bake has no output")
+    top = hou.Geometry(geo)
     top.deletePrims([p for p in top.prims() if p.attribValue("name") != "animation"])
+    baked = channels(top)
+    frames = int(round(node.evalParm("duration") * doc.FPS))
+    if not baked or any(len(prim.keyFrames()) != frames for prim in baked.values()):
+        raise NotReady("the bake does not have a key on every frame")
+    _bake_cache[sid] = (tag, top)
     return top
 
 
 def source_tag(node):
     """what the rig should follow now"""
-    d = doc.loads(node.parm("kimodo_doc").unexpandedString())
-    paths = d["result"]["npz"]
-    shown = paths[min(max(node.evalParm("sample"), 0), len(paths) - 1)] if paths else ""
     poses = node.parm("kimodo_poses").unexpandedString()
-    return f"{shown}|{node.evalParm('duration'):g}|{hashlib.md5(poses.encode()).hexdigest()[:12]}"
+    return (
+        f"{node.parm('rig_npz').unexpandedString()}|{node.evalParm('duration'):g}|"
+        f"{hashlib.md5(poses.encode()).hexdigest()[:12]}"
+    )
 
 
 def _set_stash(node, top, tag):
@@ -79,7 +110,7 @@ def stash_tag(node):
 def merge(node, keep_frames, tag):
     """rebuild the stash from the bake, keeping its own keys on keep_frames"""
     old = stash(node)
-    new = bake(node)
+    new = hou.Geometry(bake(node))
     if old is not None and keep_frames:
         old_channels = channels(old)
         frames = [float(f + 1) for f in keep_frames]
@@ -122,7 +153,7 @@ def edited_frames(node, only=None):
     top = stash(node)
     if top is None:
         return []
-    mine, baked = channels(top), channels(bake_cached(node))
+    mine, baked = channels(top), channels(bake(node))
     edited = set()
     if only is not None:
         for f in only:
@@ -155,20 +186,6 @@ def edited_frames(node, only=None):
     return sorted(edited)
 
 
-_bake_cache = {}
-
-
-def bake_cached(node):
-    """bake(), copied only after the bake node cooked again"""
-    inner = node.node(BAKE)
-    inner.geometry()
-    key = inner.cookCount()
-    cached = _bake_cache.get(node.sessionId())
-    if cached is None or cached[0] != key:
-        cached = _bake_cache[node.sessionId()] = (key, bake(node))
-    return cached[1]
-
-
 def pose(node, frame):
     """the rig's pose at a kimodo frame"""
     geo = node.node(POSE).geometryAtFrame(frame + 1)
@@ -176,6 +193,10 @@ def pose(node, frame):
         raise hou.Error(
             f"The rig has no pose at frame {frame + 1}: {'; '.join(node.node(POSE).errors()) or 'empty output'}"
         )
+    return pose_from_geometry(geo)
+
+
+def pose_from_geometry(geo):
     names = list(geo.pointStringAttribValues("name"))
     index = [names.index(n) for n in skeleton.JOINT_NAMES]
     world = np.array(geo.pointFloatAttribValues("transform")).reshape(-1, 3, 3)[index].transpose(0, 2, 1)
