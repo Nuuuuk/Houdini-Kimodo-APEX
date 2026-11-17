@@ -112,6 +112,14 @@ def add_range(d, ctype, first, last):
     return cid
 
 
+def add_keyframe(d, ctype, frame):
+    if frame in _taken(d, ctype):
+        return None
+    cid = _new_id(d, "constraints", "c")
+    d["constraints"].append({"id": cid, "type": ctype, "frames": [frame]})
+    return cid
+
+
 def delete_run(d, cid, run):
     c = _find(d, "constraints", cid)
     c["frames"] = [f for f in c["frames"] if f not in set(run)]

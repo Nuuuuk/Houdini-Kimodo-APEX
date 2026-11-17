@@ -9,7 +9,7 @@ import time
 import hou
 import numpy as np
 
-from . import client, constraints, doc, rig, skeleton
+from . import client, constraints, doc, rig, rootpath, skeleton
 
 CACHE_DIR = "$HIP/kimodo"
 _running = {}
@@ -112,6 +112,8 @@ def read_poses(node):
             int(f): constraints.Pose(
                 None if p["rot"] is None else constraints.axis_angle_to_matrix(np.array(p["rot"])),
                 np.array([np.nan if v is None else v for v in p["root"]], dtype=np.float64),
+                None,
+                tuple(p["heading"]) if p.get("heading") else None,
             )
             for f, p in raw.items()
         }
@@ -125,6 +127,7 @@ def write_poses(node, poses):
         str(f): {
             "rot": None if p.local_rots is None else constraints.matrix_to_axis_angle(p.local_rots).tolist(),
             "root": [None if np.isnan(v) else float(v) for v in p.root_position],
+            **({} if p.heading is None else {"heading": list(p.heading)}),
         }
         for f, p in sorted(poses.items())
     }
@@ -147,7 +150,7 @@ def pose_source(node, frames):
         p = rig.pose(node, frame)
         if s is not None and frame not in edited:
             return constraints.Pose(
-                p.local_rots, np.array([s.root_position[0], p.root_position[1], s.root_position[2]])
+                p.local_rots, np.array([s.root_position[0], p.root_position[1], s.root_position[2]]), None, s.heading
             )
         return p
 
@@ -155,7 +158,8 @@ def pose_source(node, frames):
 
 
 def constraints_json(node, d):
-    return constraints.to_kimodo_json(d["constraints"], pose_source(node, constraint_frames(d)))
+    cjson = constraints.to_kimodo_json(d["constraints"], pose_source(node, constraint_frames(d)))
+    return rootpath.apply(cjson) if d.get("smooth_root_path") else cjson
 
 
 def constraints_key(cjson):

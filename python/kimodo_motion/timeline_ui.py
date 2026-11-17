@@ -30,6 +30,8 @@ class Canvas(panel_parts.TimelineCanvas):
     run_move_requested = QtCore.Signal(str, object, int)
     run_delete_requested = QtCore.Signal(str, object)
     range_requested = QtCore.Signal(str, int, int)
+    heading_requested = QtCore.Signal(str, bool)
+    smooth_path_requested = QtCore.Signal(bool)
     play_requested = QtCore.Signal()
     step_requested = QtCore.Signal(int)
     hint_changed = QtCore.Signal(str)
@@ -37,9 +39,10 @@ class Canvas(panel_parts.TimelineCanvas):
     def __init__(self):
         self.drag = None
         self.preview = None
-        self.editor = None
+        self.editor, self.editing = None, None
         self.hint = ""
         self.zoom = 1.0
+        self.smooth_path = False
         super().__init__()
         self.setMouseTracking(True)
         self.setFocusPolicy(QtCore.Qt.StrongFocus)
@@ -61,6 +64,11 @@ class Canvas(panel_parts.TimelineCanvas):
         self.setMinimumWidth(self.span() * self.m.px_per_frame)
         if self.frame != before:
             self.follow()
+
+    def set_smooth_path(self, on):
+        if on != self.smooth_path:
+            self.smooth_path = on
+            self.update()
 
     def set_frame(self, frame):
         if frame != self.frame:
@@ -189,18 +197,36 @@ class Canvas(panel_parts.TimelineCanvas):
 
     def press_track(self, event, pos, ctype):
         c, run = self.run_at(pos)
-        if event.button() == QtCore.Qt.RightButton and c is not None:
+        if event.button() == QtCore.Qt.RightButton and (c is not None or ctype == "root2d"):
             menu = QtWidgets.QMenu(self)
-            delete = menu.addAction("Delete")
-            menu.addSeparator()
-            types = {
-                menu.addAction(f"Change to {panel_parts.TRACKS[i + 1]}"): t
-                for i, t in enumerate(panel_parts.TRACK_TYPES)
-                if t != ctype
-            }
+            delete = heading = smooth = None
+            types = {}
+            if c is not None:
+                delete = menu.addAction("Delete")
+                menu.addSeparator()
+                types = {
+                    menu.addAction(f"Change to {panel_parts.TRACKS[i + 1]}"): t
+                    for i, t in enumerate(panel_parts.TRACK_TYPES)
+                    if t != ctype
+                }
+                menu.addSeparator()
+            if c is not None and ctype == "root2d":
+                heading = menu.addAction("Constrain Heading")
+                heading.setCheckable(True)
+                heading.setChecked(bool(c.get("heading")))
+            if ctype == "root2d":
+                smooth = menu.addAction("Smooth Path Through Keyframes")
+                smooth.setCheckable(True)
+                smooth.setChecked(self.smooth_path)
             chosen = menu.exec(event.globalPosition().toPoint())
-            if chosen is delete:
+            if chosen is None:
+                pass
+            elif chosen is delete:
                 self.run_delete_requested.emit(c["id"], run)
+            elif chosen is heading:
+                self.heading_requested.emit(c["id"], not c.get("heading"))
+            elif chosen is smooth:
+                self.smooth_path_requested.emit(not self.smooth_path)
             elif chosen in types:
                 self.type_requested.emit(c["id"], types[chosen])
         elif event.button() == QtCore.Qt.LeftButton:
@@ -304,7 +330,7 @@ class Canvas(panel_parts.TimelineCanvas):
         editor.editingFinished.connect(lambda: self.finish_edit(pid))
         editor.show()
         editor.setFocus()
-        self.editor = editor
+        self.editor, self.editing = editor, pid
 
     def finish_edit(self, pid):
         editor = self.editor
@@ -323,9 +349,13 @@ class Canvas(panel_parts.TimelineCanvas):
             editor.deleteLater()
 
     def eventFilter(self, obj, event):
-        if obj is self.editor and event.type() == QtCore.QEvent.KeyPress and event.key() == QtCore.Qt.Key_Escape:
-            self.close_editor()
-            return True
+        if obj is self.editor and event.type() in (QtCore.QEvent.KeyPress, QtCore.QEvent.ShortcutOverride):
+            key = event.key()
+            if key in (QtCore.Qt.Key_Escape, QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter):
+                if event.type() == QtCore.QEvent.KeyPress:
+                    self.finish_edit(self.editing) if key != QtCore.Qt.Key_Escape else self.close_editor()
+                event.accept()
+                return True
         return super().eventFilter(obj, event)
 
     def paintEvent(self, event):
@@ -343,6 +373,9 @@ class Canvas(panel_parts.TimelineCanvas):
         for pr in prompts:
             self.paint_prompt(p, pr)
         p.setRenderHint(QtGui.QPainter.Antialiasing)
+        waypoints = sorted(f for c in self.constraints if c["type"] == "root2d" for f in c["frames"])
+        if self.smooth_path and len(waypoints) > 1:
+            self.paint_constraint(p, {"type": "root2d"}, list(range(waypoints[0], waypoints[-1] + 1)), 70)
         drag = self.drag or {"kind": ""}
         moving = drag["kind"] == "move" and drag["moved"]
         for c in self.constraints:
@@ -402,6 +435,7 @@ class Canvas(panel_parts.TimelineCanvas):
         for run in timeline.runs(c["frames"] if frames is None else frames):
             if len(run) > 1:
                 p.drawRoundedRect(QtCore.QRectF(run[0] * scale, y - size / 2, len(run) * scale, size), 2, 2)
+                mark = QtCore.QLineF(run[0] * scale + 2, y, (run[-1] + 1) * scale - 2, y)
             else:
                 cx = self.frame_x(run[0])
                 p.drawPolygon(
@@ -414,6 +448,11 @@ class Canvas(panel_parts.TimelineCanvas):
                         ]
                     )
                 )
+                mark = QtCore.QLineF(cx - size + 2, y, cx + size - 2, y)
+            if c.get("heading"):
+                p.setPen(QtGui.QPen(QtGui.QColor(255, 255, 255, alpha), 1.5))
+                p.drawLine(mark)
+                p.setPen(QtCore.Qt.NoPen)
 
 
 class Panel(panel_parts.KimodoPanel):
@@ -427,6 +466,8 @@ class Panel(panel_parts.KimodoPanel):
         canvas.run_move_requested.connect(lambda cid, run, delta: self.edit(timeline_edit.move_run, cid, run, delta))
         canvas.run_delete_requested.connect(lambda cid, run: self.edit(timeline_edit.delete_run, cid, run))
         canvas.range_requested.connect(lambda ctype, a, b: self.edit(timeline_edit.add_range, ctype, a, b))
+        canvas.heading_requested.connect(lambda cid, on: self.edit(timeline_edit.set_heading, cid, on))
+        canvas.smooth_path_requested.connect(lambda on: self.edit(timeline_edit.set_smooth_path, on))
         self.hint = QtWidgets.QLabel()
         self.hint.setWordWrap(True)
         self.hint.setEnabled(False)
@@ -439,6 +480,7 @@ class Panel(panel_parts.KimodoPanel):
         self.generate_button.setToolTip("Generate with the node's settings; Cancel while it runs.")
         self.generate_button.clicked.connect(self.generate_or_cancel)
         self.lower_layout.itemAt(1).layout().insertWidget(0, self.generate_button)
+        self.guide_key = None
         self.playbar_callback = None
         if hou.isUIAvailable():
             self.playbar_callback = self.on_playbar
@@ -457,6 +499,13 @@ class Panel(panel_parts.KimodoPanel):
         self.generate_button.setText("Cancel" if busy else "Generate")
         if node is None:
             self.hint.setText("Select a Kimodo Motion node.")
+        else:
+            d = motion_node.read_doc(node)
+            self.timeline.canvas.set_smooth_path(bool(d.get("smooth_root_path")))
+            key = (d["constraints"], d.get("smooth_root_path"), node.evalParm("unapplied"), node.evalParm("rig_npz"))
+            if key != self.guide_key and not motion_node.is_editing(node):
+                self.guide_key = key
+                timeline_edit.update_root_path_guide(node)
 
     def on_playbar(self, event_type, frame):
         if event_type == hou.playbarEvent.FrameChanged:

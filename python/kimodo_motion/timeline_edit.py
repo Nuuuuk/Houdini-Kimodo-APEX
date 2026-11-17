@@ -1,10 +1,12 @@
 """timeline edits on the node, between the ui and timeline.py."""
 
 import copy
+import json
+import math
 
 import hou
 
-from . import doc, motion_node, rig, timeline
+from . import doc, motion_node, rig, rootpath, timeline
 
 
 def current_doc(node):
@@ -155,3 +157,84 @@ def delete_run(node, cid, run):
     timeline.delete_run(after, cid, list(run))
     _write_constraints(node, before, after, {}, "Delete Kimodo constraint")
     motion_node.set_status(node, f"{motion_node.TYPE_LABELS[ctype]} constraint on {_span_text(list(run))} deleted.")
+
+
+def set_heading(node, cid, on):
+    """constrain heading on or off for 2d root markers"""
+    d = current_doc(node)
+    c = next(c for c in d["constraints"] if c["id"] == cid)
+    if on:
+        c["heading"] = True
+    else:
+        c.pop("heading", None)
+    with hou.undos.group("Kimodo 2D Root heading"):
+        motion_node.write_doc(node, d)
+    motion_node.update_unapplied(node)
+    motion_node.set_status(
+        node, "2D Root constraint: heading constrained too." if on else "2D Root constraint: position only."
+    )
+
+
+def set_smooth_path(node, on):
+    """callback of smooth 2d root path"""
+    d = current_doc(node)
+    if on:
+        d["smooth_root_path"] = True
+        for frame in (0, doc.total_frames(d) - 1):
+            timeline.add_keyframe(d, "root2d", frame)
+    else:
+        d.pop("smooth_root_path", None)
+    with hou.undos.group("Kimodo smooth root path"):
+        motion_node.write_doc(node, d)
+    motion_node.update_unapplied(node)
+    frames = sorted(f for c in d["constraints"] if c["type"] == "root2d" for f in c["frames"])
+    motion_node.set_status(
+        node,
+        f"Smooth path on: one 2D Root path through {len(frames)} keyframes, frames {frames[0] + 1} to {frames[-1] + 1}."
+        if on
+        else "Smooth path off: 2D Root keyframes are sent one by one.",
+    )
+
+
+GUIDE_HEIGHT = 0.005
+MARK, TICK = 0.04, 0.25
+
+
+def update_root_path_guide(node):
+    """store what the viewport draws for the smooth path"""
+    parm = node.parm("root_path_guide")
+    if parm is None:
+        return
+    d = motion_node.read_doc(node)
+    text = ""
+    if any(c["type"] == "root2d" for c in d["constraints"]):
+        try:
+            text = json.dumps(rootpath.guide(motion_node.constraints_json(node, d)))
+        except rig.NotReady:
+            return
+    if parm.unexpandedString() != text:
+        with hou.undos.disabler():
+            parm.set(text)
+
+
+def cook_root_path(sop):
+    """python sop: the smooth 2d root path on the ground"""
+    parm = sop.parent().parm("root_path_guide")
+    text = parm.unexpandedString() if parm is not None else ""
+    if not text.strip():
+        return
+    shapes, geo = json.loads(text), sop.geometry()
+
+    def polyline(points, closed=False):
+        poly = geo.createPolygon(is_closed=closed)
+        for x, z in points:
+            pt = geo.createPoint()
+            pt.setPosition((x, GUIDE_HEIGHT, z))
+            poly.addVertex(pt)
+
+    for line in shapes["lines"]:
+        polyline(line)
+    for x, z in shapes["points"]:
+        polyline([(x - MARK, z), (x, z + MARK), (x + MARK, z), (x, z - MARK)], closed=True)
+    for x, z, c, s in shapes["headings"]:
+        polyline([(x, z), (x + TICK * s, z + TICK * c)])
