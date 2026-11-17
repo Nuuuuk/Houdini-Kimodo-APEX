@@ -9,7 +9,6 @@ from . import doc, motion_node, rig
 
 TRACKS = ("Prompts", "Full-Body", "2D Root", "Left Hand", "Right Hand", "Left Foot", "Right Foot")
 TRACK_TYPES = ("fullbody", "root2d", "left-hand", "right-hand", "left-foot", "right-foot")
-POSE_HINT = "Enter in the viewer also edits; Esc exits."
 WIDE_ASPECT = 2.2
 
 STAGE_COLORS = {
@@ -22,6 +21,16 @@ STAGE_COLORS = {
     "canceled": "#8a8a8a",
     "error": "#d9534f",
 }
+
+
+def paste_entries(ctype, frame):
+    """[(text, keep the frame's root)] for a track's paste entries"""
+    n = frame + 1
+    if ctype == "fullbody":
+        return [(f"Paste Pose at Frame {n} with Copied Root", False), (f"Paste Pose at Frame {n}, Keep This Frame's Root", True)]
+    if ctype == "root2d":
+        return [(f"Paste Copied Root at Frame {n}", False)]
+    return [(f"Paste {TRACKS[TRACK_TYPES.index(ctype) + 1]} at Frame {n}, Relative to This Frame's Root", False)]
 
 
 class Metrics:
@@ -104,11 +113,7 @@ class TimelineCanvas(FontSized):
         menu, actions = QtWidgets.QMenu(self), {}
         if constraint is not None:
             actions[menu.addAction("Copy Pose")] = lambda: self.copy_requested.emit(frame)
-        label = f"Paste Pose at Frame {self.frame + 1}"
-        pastes = [(label, False)]
-        if ctype in ("fullbody", "root2d"):
-            pastes.append((f"{label}, Keep Its Root Position", True))
-        for text, keep_root in pastes:
+        for text, keep_root in paste_entries(ctype, self.frame):
             action = menu.addAction(text)
             action.setEnabled(motion_node.has_copied_pose())
             actions[action] = lambda keep_root=keep_root: self.paste_requested.emit(ctype, keep_root)
@@ -280,6 +285,7 @@ class StatusWidget(QtWidgets.QFrame):
         err.addWidget(self.detail)
         err.addLayout(actions)
         col.addWidget(self.error)
+        self.shown = None
         self.show_status(
             {
                 "stage": "idle",
@@ -294,12 +300,17 @@ class StatusWidget(QtWidgets.QFrame):
 
     def show_status(self, st):
         stage = st["stage"]
-        self.dot.setStyleSheet(f"background: {STAGE_COLORS.get(stage, '#8a8a8a')}; border-radius: 5px;")
-        self.text.setText(st["text"])
         seconds = st["elapsed"]
         if stage in motion_node.ACTIVE_STAGES and st["started"] is not None:
             seconds = time.monotonic() - st["started"]
-        self.elapsed.setText("" if seconds is None else f"{seconds:.0f} s")
+        elapsed = "" if seconds is None else f"{seconds:.0f} s"
+        shown = (stage, st["text"], st["progress"], st["detail"], st["log"], elapsed)
+        if shown == self.shown:
+            return
+        self.shown = shown
+        self.dot.setStyleSheet(f"background: {STAGE_COLORS.get(stage, '#8a8a8a')}; border-radius: 5px;")
+        self.text.setText(st["text"])
+        self.elapsed.setText(elapsed)
         active = stage in motion_node.ACTIVE_STAGES
         self.bar.setVisible(active)
         if active:
@@ -320,6 +331,7 @@ class KimodoPanel(QtWidgets.QWidget):
         super().__init__()
         self.node = None
         self.refreshing = False
+        self.doc_text, self.doc = None, None
         self.parm_editor = None
         self.parm_editor_factory = parm_editor_factory or (lambda node: hou.qt.ParmDialog(node, compact=True))
         self.timeline = TimelineArea()
@@ -346,10 +358,13 @@ class KimodoPanel(QtWidgets.QWidget):
         self.lower_layout.addWidget(self.status, 0)
         self.edit_button = QtWidgets.QPushButton("Edit Pose")
         self.edit_button.setCheckable(True)
-        self.edit_button.setToolTip("Pose the rig in the viewport at the current frame (APEX animate state).")
+        self.edit_button.setToolTip(
+            "Pose the rig in the viewer at the current frame.\n"
+            "Enter in the viewer, with this node selected, does the same."
+        )
         self.edit_button.clicked.connect(self.edit_pose)
         self.done_button = QtWidgets.QPushButton("Done")
-        self.done_button.setToolTip("Leave pose editing.")
+        self.done_button.setToolTip("Leave pose editing. Esc in the viewer does the same.")
         self.done_button.clicked.connect(self.end_edit)
         pose_row = QtWidgets.QHBoxLayout()
         pose_row.addWidget(self.edit_button)
@@ -357,10 +372,6 @@ class KimodoPanel(QtWidgets.QWidget):
         pose_row.addStretch(1)
         self.lower_layout.addLayout(pose_row, 0)
         self.lower_layout.addStretch(1)
-        self.pose_hint = QtWidgets.QLabel(POSE_HINT)
-        self.pose_hint.setWordWrap(True)
-        self.pose_hint.setEnabled(False)
-        self.lower_layout.insertWidget(2, self.pose_hint, 0)
         self.splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
         self.splitter.addWidget(self.timeline)
         self.splitter.addWidget(self.lower)
@@ -380,7 +391,7 @@ class KimodoPanel(QtWidgets.QWidget):
         if node is not None:
             if self.parm_editor is None:
                 self.parm_editor = self.parm_editor_factory(node)
-                self.lower_layout.takeAt(3)
+                self.lower_layout.takeAt(2)
                 self.lower_layout.addWidget(self.parm_editor, 1)
             else:
                 self.parm_editor.setNode(node)
@@ -399,12 +410,11 @@ class KimodoPanel(QtWidgets.QWidget):
             editing = motion_node.is_editing(self.node)
             self.edit_button.setChecked(editing)
             self.done_button.setEnabled(editing)
-            d = motion_node.read_doc(self.node)
-            frame = int(round(hou.frame())) - 1
-            self.pose_hint.setText(
-                motion_node.pinned_note(d, frame) if editing and motion_node.pinned_note(d, frame) else POSE_HINT
-            )
-            self.timeline.canvas.set_state(d["prompts"], frame, d["constraints"])
+            text = self.node.parm("kimodo_doc").unexpandedString()
+            if text != self.doc_text:
+                self.doc_text, self.doc = text, motion_node.read_doc(self.node)
+            d = self.doc
+            self.timeline.canvas.set_state(d["prompts"], int(round(hou.frame())) - 1, d["constraints"])
         except (hou.ObjectWasDeleted, doc.DocError):
             self.node = None
         finally:

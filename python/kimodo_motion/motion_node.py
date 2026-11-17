@@ -229,7 +229,7 @@ def pinned_note(d, frame):
     if not types or "fullbody" in types:
         return ""
     labels = ", ".join(TYPE_LABELS[t] for t in doc.CONSTRAINT_TYPES if t in types)
-    return f"Frame {frame + 1} pins {labels}: only those controls are shown. Add a Full-Body constraint to pose more."
+    return f"Frame {frame + 1} pins {labels} only"
 
 
 def release_unpinned(node, d):
@@ -396,7 +396,7 @@ def paste_pose(node, ctype, frame, keep_root=False):
 
     _outside_edit(node, apply)
     update_unapplied(node)
-    where = " at its own root position" if keep_root else ""
+    where = ", keeping this frame's root" if keep_root else ""
     set_status(node, f"Pose of frame {_copied['frame'] + 1} pasted as a {TYPE_LABELS[ctype]} keyframe at frame {frame + 1}{where}.")
     return entry["id"]
 
@@ -483,6 +483,14 @@ def result_file(node, path):
     return expanded
 
 
+def set_result_samples(node):
+    """tell the parms how many samples there are"""
+    count = max(len(read_doc(node)["result"]["npz"]), 1)
+    if node.evalParm("result_samples") != count:
+        with hou.undos.disabler():
+            node.parm("result_samples").set(count)
+
+
 def shown_result(node):
     """'<request key>:<sample>' of the shown sample, '' while there is none"""
     paths = read_doc(node)["result"]["npz"]
@@ -537,6 +545,8 @@ def _outside_edit(node, fn):
     finally:
         if viewer is not None and viewer.isCurrentTab():
             viewer.setCurrentState(ANIMATE_STATE)
+            _shown.pop(sid, None)
+            _titled.pop(sid, None)
         if not held:
             _switching.discard(sid)
 
@@ -635,6 +645,7 @@ class _GenerateJob:
         with hou.undos.disabler():
             write_doc(self.node, d)
         embed_results(self.node, self.paths)
+        set_result_samples(self.node)
         sync_rig(self.node)
         update_unapplied(self.node)
         self.status(text, "done")
@@ -772,7 +783,7 @@ _changes = {}
 _watched = {}
 _shown = {}
 WATCHED_PARMS = ("animation", "kimodo_doc", "kimodo_poses", "sample")
-WATCH_INTERVAL = 0.2
+WATCH_INTERVAL = 0.1
 
 
 def scene_viewers():
@@ -832,6 +843,10 @@ def edit_pose(node):
         node.setCurrent(True, clear_all_selected=True)
     viewer.setCurrentState(ANIMATE_STATE)
     watch(node)
+    try:
+        show_pinned_controls(node, viewer)
+    except hou.Error:
+        pass
     return is_editing(node)
 
 
@@ -870,6 +885,7 @@ def node_ready(node):
         set_busy(node, False)
         with hou.undos.disabler():
             node.parm("status").set(INTERRUPTED)
+    set_result_samples(node)
     watch(node)
 
 
@@ -915,31 +931,73 @@ def _poll():
 
 def show_pinned_controls(node, viewer):
     """offer only the controls the current frame pins"""
-    sid = node.sessionId()
-    wanted = pinned_at(read_doc(node), int(round(hou.frame())) - 1)
-    key = None if wanted is None else frozenset(wanted)
-    if sid in _shown and _shown[sid] == key:
-        return
-    names = rig.pose_controls() if wanted is None else wanted
-    viewer.runStateCommand(
-        "showControls",
-        {
-            "controls": [rig.CONTROLS_PATH + name for name in sorted(names)],
-            "controls_in_tree_format": False,
-            "pick_modifier": hou.pickModifier.Replace,
-        },
-    )
-    if wanted is not None:
-        import apex.ui.statecommandutils as scu
+    import apex.control_2 as ac
+    import apex.ui.statecommandutils as scu
 
-        selected = list(scu.getAnimateState(viewer).control_selection)
-        still = [path for path in selected if path.rsplit("/", 1)[-1] in wanted]
-        if len(still) != len(selected):
-            viewer.runStateCommand(
-                "selectControls",
-                {"controls": still, "controls_in_tree_format": False, "pick_modifier": hou.pickModifier.Replace},
-            )
-    _shown[sid] = key
+    sid = node.sessionId()
+    everything = rig.pose_controls()
+    pinned = pinned_at(read_doc(node), int(round(hou.frame())) - 1)
+    pinned = everything if pinned is None else pinned
+    hide = bool(node.evalParm("unpinned_controls"))
+    visible = pinned if hide else everything
+    disabled = {rig.CONTROLS_PATH + name for name in (set() if hide else everything - pinned)}
+    scene = scu.getAnimateState(viewer).scene
+    templates = [t for t in (scene.getData(f"{path}/control_template") for path in scene.findDataPaths("*.rig")) if t is not None]
+    current = {path for t in templates for path in ac.getEnabledControlsFromTemplate(t, invert=True)}
+    if _shown.get(sid) == frozenset(visible) and current == disabled:
+        return
+    if _shown.get(sid) != frozenset(visible):
+        viewer.runStateCommand(
+            "showControls",
+            {
+                "controls": [rig.CONTROLS_PATH + name for name in sorted(visible)],
+                "controls_in_tree_format": False,
+                "pick_modifier": hou.pickModifier.Replace,
+            },
+        )
+    if current != disabled:
+        for template in templates:
+            ac.setControlTemplateEnabled(template, sorted(current - disabled), True)
+            ac.setControlTemplateEnabled(template, sorted(disabled), False)
+        viewer.curViewport().draw()
+    selected = list(scu.getAnimateState(viewer).control_selection)
+    still = [path for path in selected if path.rsplit("/", 1)[-1] in pinned]
+    if len(still) != len(selected):
+        viewer.runStateCommand(
+            "selectControls",
+            {"controls": still, "controls_in_tree_format": False, "pick_modifier": hou.pickModifier.Replace},
+        )
+    _shown[sid] = frozenset(visible)
+
+
+HUD_PREFIX = "apexanimate:hudtitleprefix"
+_titled = {}
+
+
+def show_hint_title(node, viewer):
+    """posing info in the title of the state's hints"""
+    import apex.ui.statecommandutils as scu
+
+    note = pinned_note(read_doc(node), int(round(hou.frame())) - 1)
+    text = (f"{note}  |  " if note else "") + "Esc exits  |  "
+    if _titled.get(node.sessionId()) != text:
+        node.setCachedUserData(HUD_PREFIX, text)
+        scu.getAnimateState(viewer).updateHUD()
+        _titled[node.sessionId()] = text
+
+
+_redo_seen = {}
+
+
+def follow_undo(node, viewer):
+    """after an undo or redo while posing the state writes its animation"""
+    import apex.ui.statecommandutils as scu
+
+    sid, redo = node.sessionId(), len(hou.undos.redoLabels())
+    if sid in _redo_seen and _redo_seen[sid] != redo:
+        with hou.undos.disabler():
+            scu.getAnimateState(viewer).writeToSopNode()
+    _redo_seen[sid] = redo
 
 
 def poll(node):
@@ -963,10 +1021,14 @@ def poll(node):
     if editing:
         try:
             show_pinned_controls(node, viewer)
+            show_hint_title(node, viewer)
+            follow_undo(node, viewer)
         except hou.Error:
             pass
     else:
         _shown.pop(sid, None)
+        _titled.pop(sid, None)
+        _redo_seen.pop(sid, None)
     if (seen[0] and not editing) or changes != seen[1] or sid in _retry:
         if finish_edit(node):
             seen[1] = _changes.get(sid, 0)
