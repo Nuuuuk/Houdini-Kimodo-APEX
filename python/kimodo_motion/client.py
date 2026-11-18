@@ -175,6 +175,9 @@ def check_exited(proc):
         raise ServiceExited(f"Kimodo service exited with code {code}{status}; see {log_path()}")
 
 
+MAX_LOG_BYTES = 4_000_000
+
+
 def log_path(root=None):
     return os.path.join(root or os.environ.get("KIMODO_MOTION", ""), "service.log")
 
@@ -184,7 +187,8 @@ def start_service(root=None):
     cmd = service_command(root)
     # houdini sets PYTHONHOME for its own python, the venv must not see it
     env = {k: v for k, v in os.environ.items() if not k.upper().startswith("PYTHON")}
-    log = open(log_path(root), "ab")
+    path = log_path(root)
+    log = open(path, "wb" if os.path.isfile(path) and os.path.getsize(path) > MAX_LOG_BYTES else "ab")
     kwargs = {"stdin": subprocess.DEVNULL, "stdout": log, "stderr": subprocess.STDOUT, "env": env}
     if sys.platform == "win32":
         kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP

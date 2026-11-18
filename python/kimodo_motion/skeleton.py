@@ -194,6 +194,18 @@ def load_motion(path):
     return m
 
 
+def motion_from_rotations(local_rots, root_positions):
+    rest = rest_positions()
+    world = np.array(local_rots, dtype=np.float64)
+    positions = np.zeros(world.shape[:2] + (3,))
+    positions[:, 0] = root_positions
+    for j in range(1, NUM_JOINTS):
+        p = PARENTS[j]
+        world[:, j] = world[:, p] @ world[:, j]
+        positions[:, j] = positions[:, p] + world[:, p] @ (rest[j] - rest[p])
+    return Motion(positions, world, np.asarray(local_rots, dtype=np.float64))
+
+
 def pose_arrays(motion, index):
     """point positions and kinefx transforms for one frame"""
     i = min(max(int(index), 0), motion.num_frames - 1)

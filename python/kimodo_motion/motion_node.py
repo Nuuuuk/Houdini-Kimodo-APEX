@@ -2,22 +2,22 @@
 
 import base64
 import hashlib
+import io
 import json
 import os
 import re
+import shutil
+import tempfile
 import time
-import zlib
 
 import hou
 import numpy as np
 
 from . import client, constraints, doc, rig, skeleton
 
-CACHE_DIR = "$HIP/kimodo"
 _running = {}
 _status = {}
 ACTIVE_STAGES = ("starting", "loading", "generating", "canceling")
-_motions = {}
 
 
 def read_doc(node):
@@ -167,114 +167,104 @@ def doc_from_parms(node):
     return d
 
 
+_raw_cache = {}
 _poses_cache = {}
+_types_cache = {}
+_pose_of = {}
+
+
+def _raw_poses(node):
+    """{frame: stored pose as written}"""
+    text = node.parm("kimodo_poses").unexpandedString()
+    if text not in _raw_cache:
+        _raw_cache.clear()
+        _raw_cache[text] = {int(f): p for f, p in (json.loads(text) if text.strip() else {}).items()}
+    return _raw_cache[text]
+
+
+def raw_pose(pose):
+    raw = {
+        "rot": None if pose.local_rots is None else constraints.matrix_to_axis_angle(pose.local_rots).tolist(),
+        "root": [None if np.isnan(v) else float(v) for v in pose.root_position],
+    }
+    if pose.root_2d is not None:
+        raw["root2d"] = [float(v) for v in pose.root_2d]
+    return raw
 
 
 def read_poses(node):
     """{frame: Pose}, a root only pose has local_rots None"""
-    return _parse_poses(node.parm("kimodo_poses").unexpandedString())
-
-
-def _parse_poses(text):
-    cached = _poses_cache.get(text)
-    if cached is None:
-        raw = json.loads(text) if text.strip() else {}
-        cached = {
-            int(f): constraints.Pose(
+    text = node.parm("kimodo_poses").unexpandedString()
+    if text not in _poses_cache:
+        _poses_cache.clear()
+        _poses_cache[text] = {
+            f: constraints.Pose(
                 None if p["rot"] is None else constraints.axis_angle_to_matrix(np.array(p["rot"])),
                 np.array([np.nan if v is None else v for v in p["root"]], dtype=np.float64),
                 None if p.get("root2d") is None else tuple(p["root2d"]),
             )
-            for f, p in raw.items()
+            for f, p in _raw_poses(node).items()
         }
-        _poses_cache.clear()
-        _poses_cache[text] = cached
-    return cached
+    return _poses_cache[text]
 
 
-def write_poses(node, poses):
-    old_text = node.parm("kimodo_poses").unexpandedString()
-    old, old_raw = _parse_poses(old_text), (json.loads(old_text) if old_text.strip() else {})
-    raw = {}
-    for f, p in sorted(poses.items()):
-        if old.get(f) is p:
-            raw[str(f)] = old_raw[str(f)]
-            continue
-        raw[str(f)] = {
-            "rot": None if p.local_rots is None else constraints.matrix_to_axis_angle(p.local_rots).tolist(),
-            "root": [None if np.isnan(v) else float(v) for v in p.root_position],
-        }
-        if p.root_2d is not None:
-            raw[str(f)]["root2d"] = [float(v) for v in p.root_2d]
-    text = json.dumps(raw) if raw else ""
-    if old_text != text:
-        node.parm("kimodo_poses").set(text)
-    return _parse_poses(text)
-
-
-_captured = {}
-
-
-def capture_poses(node, d, reference=None, record=False):
-    """store the pose each constraint frame sends now"""
-    frames = constraint_frames(d)
-    stored = dict(read_poses(node))
-    top = rig.stash(node)
-    if top is None:
-        edited = set()
-    elif reference is not None:
-        edited = rig._differing_frames(rig.channels(top), rig.channels(reference), frames)
-    elif rig.stash_tag(node) in (None, rig.source_tag(node)):
-        edited = set(rig.edited_frames(node, only=frames))
-    else:
-        edited = set(frames)
-    mine = rig.channels(top) if top is not None else None
-    taken = _captured.setdefault(node.sessionId(), {})
-    for frame in frames:
-        if frame in stored and frame not in edited:
-            continue
-        keys = None if mine is None else np.array([prim.eval(float(frame + 1)) for prim in mine.values()]).tobytes()
-        if frame in stored and keys is not None and taken.get(frame) == keys:
-            continue
-        pose = rig.pose(node, frame)
-        stored[frame] = constraints.Pose(pose.local_rots, pose.root_position, pose.root_2d)
-        taken[frame] = keys
-    stored = {frame: pose for frame, pose in stored.items() if frame in frames}
-    if record:
-        stored = write_poses(node, stored)
-        write_rig_keep(node, d, record=True)
-    else:
-        with hou.undos.disabler():
-            stored = write_poses(node, stored)
-            write_rig_keep(node, d)
-    return stored
+def write_raw_poses(node, raw, record=False):
+    """text that was read is written back unchanged, digit for digit"""
+    text = json.dumps({str(f): raw[f] for f in sorted(raw)}) if raw else ""
+    if node.parm("kimodo_poses").unexpandedString() != text:
+        if record:
+            node.parm("kimodo_poses").set(text)
+        else:
+            with hou.undos.disabler():
+                node.parm("kimodo_poses").set(text)
 
 
 def constraint_frames(d):
     return sorted({f for c in d["constraints"] for f in c["frames"]})
 
 
-def pose_source(node, frames):
-    """pose of each constraint frame: stored while unedited, else the rig's"""
-    stored = read_poses(node)
-    edited = set(rig.edited_frames(node, only=[f for f in frames if f in stored]))
+def types_at(d):
+    """{frame: types of the constraints on it}"""
+    found = {}
+    for c in d["constraints"]:
+        for frame in c["frames"]:
+            found.setdefault(frame, set()).add(c["type"])
+    return found
 
-    def pose(frame):
-        s = stored.get(frame)
-        if s is not None and frame not in edited and s.local_rots is not None:
-            return s
-        p = rig.pose(node, frame)
-        if s is not None and frame not in edited:
-            return constraints.Pose(
-                p.local_rots, np.array([s.root_position[0], p.root_position[1], s.root_position[2]])
-            )
-        return p
 
-    return pose
+def _types(node):
+    text = node.parm("kimodo_doc").unexpandedString()
+    if text not in _types_cache:
+        if len(_types_cache) > 16:
+            _types_cache.clear()
+        _types_cache[text] = types_at(doc.loads(text))
+    return _types_cache[text]
+
+
+def base_pose(node, frame):
+    """pose of the shown result at a frame, rest pose before the first generate"""
+    motion = shown_motion(node)
+    if motion is not None:
+        i = min(max(frame, 0), motion.num_frames - 1)
+        return constraints.Pose(motion.local_rots[i], motion.positions[i, 0].astype(np.float64))
+    return constraints.Pose(np.tile(np.eye(3), (skeleton.NUM_JOINTS, 1, 1)), skeleton.rest_positions()[0])
 
 
 def constraints_json(node, d):
-    return constraints.to_kimodo_json(d["constraints"], pose_source(node, constraint_frames(d)))
+    stored = read_poses(node)
+
+    def pose(frame):
+        s = stored.get(frame)
+        if s is not None and s.local_rots is not None:
+            return s
+        b = base_pose(node, frame)
+        return (
+            b
+            if s is None
+            else constraints.Pose(b.local_rots, np.array([s.root_position[0], b.root_position[1], s.root_position[2]]))
+        )
+
+    return constraints.to_kimodo_json(d["constraints"], pose)
 
 
 def constraints_key(cjson):
@@ -284,79 +274,138 @@ def constraints_key(cjson):
 NO_CONSTRAINTS = constraints_key([])
 
 
-def kept_keys(d):
-    """{frame: channels whose keys are ours there, None for all}"""
-    types = {}
-    for c in d["constraints"]:
-        for frame in c["frames"]:
-            types.setdefault(frame, set()).add(c["type"])
-    return {frame: rig.kept_channels(found) for frame, found in types.items()}
-
-
 def pinned_at(d, frame):
     """rig controls the constraints on a frame pin, None for all of them"""
     types = {c["type"] for c in d["constraints"] if frame in c["frames"]}
     return rig.pinned_controls(types) if types else None
 
 
-def release_unpinned(node, d):
-    """what a frame doesn't pin goes back to the generated motion"""
-    keep = {frame: names for frame, names in kept_keys(d).items() if names is not None}
-    if keep and not is_editing(node):
+def _taken(types):
+    """what a frame's rig keys take from its stored pose"""
+    return "all" if "fullbody" in types else frozenset(types)
+
+
+def _flush(node):
+    """every viewer posing the node writes its animation to the node"""
+    for viewer in editing_viewers(node):
+        import apex.ui.statecommandutils as scu
+
         with hou.undos.disabler():
-            rig.snap(node, list(keep), keep)
+            scu.getAnimateState(viewer).writeToSopNode()
 
 
-def _rig_keep_text(d, stored):
-    keep = {}
-    for c in d["constraints"]:
-        for frame in c["frames"]:
-            if frame in stored:
-                keep.setdefault(frame, set()).add(c["type"])
-    text = json.dumps({str(f): sorted(t) for f, t in sorted(keep.items())})
-    return "" if text == "{}" else text
+def _stand_for(node, frames):
+    """the rig keys on these frames now stand for their stored poses"""
+    source = shown_result(node)
+    if not frames or not rig.current(node, source):
+        return
+    _, mine = rig.stash_table(node)
+    raw, known = _raw_poses(node), _pose_of.setdefault(node.sessionId(), {})
+    for frame in frames:
+        if frame in raw and frame < mine.shape[1]:
+            known.setdefault(frame, {})[mine[:, frame].tobytes()] = raw[frame]
 
 
-def write_rig_keep(node, d, record=False):
-    text = _rig_keep_text(d, read_poses(node))
-    if node.parm("rig_keep").unexpandedString() != text:
-        if record:
-            node.parm("rig_keep").set(text)
-        else:
-            with hou.undos.disabler():
-                node.parm("rig_keep").set(text)
+def ensure_rig(node):
+    """give the rig its animation for what the node shows, if it doesn't have it"""
+    source = shown_result(node)
+    if rig.current(node, source):
+        return False
+    frames = [f for f in constraint_frames(read_doc(node)) if f in _raw_poses(node)]
+
+    def build():
+        with hou.undos.disabler():
+            if node.parm("rig_result").unexpandedString() != source:
+                node.parm("rig_result").set(source)
+            rig.build(node, source, frames)
+
+    if hou.isUIAvailable() and not rig.has_base(node, source):
+        long = doc.total_frames(doc_from_parms(node)) * 0.008 > 1.0
+        with hou.InterruptableOperation("Converting motion to rig\u2026", open_interrupt_dialog=long):
+            build()
+    else:
+        build()
+    _pose_of.pop(node.sessionId(), None)
+    _stand_for(node, list(_raw_poses(node)))
+    _shown.pop(node.sessionId(), None)
+    return True
 
 
-def _change_constraints(node, before, d, label, freed=(), force=False):
-    stored = read_poses(node)
-    frames = set(constraint_frames(d))
-    left = {frame: pose for frame, pose in stored.items() if frame in frames}
-    rebuild = force or len(left) != len(stored) or _rig_keep_text(d, left) != node.parm("rig_keep").unexpandedString()
-
-    def apply():
-        with hou.undos.group(label):
-            if rebuild:
-                captured = capture_poses(node, before, record=True)
-                write_poses(node, {frame: pose for frame, pose in captured.items() if frame in frames})
+def sync_poses(node):
+    """stored poses and auto constraints follow the rig keys"""
+    source = shown_result(node)
+    if not rig.current(node, source):
+        return
+    d = read_doc(node)
+    names, mine = rig.stash_table(node)
+    _, base_names, base = rig.base(node, source)
+    if names != base_names:
+        rows = [names.index(n) for n in base_names if n in names]
+        mine, base = mine[rows], base[[base_names.index(names[r]) for r in rows]]
+    posed = np.abs(mine - base).max(axis=0) > rig.EPS
+    types, raw = types_at(d), dict(_raw_poses(node))
+    known = _pose_of.setdefault(node.sessionId(), {})
+    added, removed = [], []
+    for frame in sorted(set(np.nonzero(posed)[0].tolist()) | set(types)):
+        if frame >= mine.shape[1]:
+            continue
+        on_frame = [c for c in d["constraints"] if frame in c["frames"]]
+        if on_frame and not posed[frame] and all(c.get("auto") for c in on_frame):
+            d["constraints"] = [c for c in d["constraints"] if c not in on_frame]
+            raw.pop(frame, None)
+            removed.append(frame)
+            continue
+        if not on_frame:
+            d["constraints"].append({"id": _new_id(d), "type": "fullbody", "frames": [frame], "auto": True})
+            added.append(frame)
+        keys = mine[:, frame].tobytes()
+        seen = known.setdefault(frame, {})
+        if keys not in seen:
+            if frame in raw and not seen and not posed[frame]:
+                seen[keys] = raw[frame]
+            else:
+                pose = rig.pose(node, frame)
+                seen[keys] = raw_pose(constraints.Pose(pose.local_rots, pose.root_position, pose.root_2d))
+        raw[frame] = seen[keys]
+    write_raw_poses(node, raw)
+    if added or removed:
+        with hou.undos.disabler():
             write_doc(node, d)
-            write_rig_keep(node, d, record=True)
-            if rig.stash(node) is not None:
-                if rig.stash_tag(node) != rig.source_tag(node):
-                    rig.merge(node, {}, rig.source_tag(node))
-                else:
-                    rig.snap(node, list(freed))
+        if added:
+            set_status(
+                node,
+                f"Full-Body keyframe added at frame {added[0] + 1}."
+                if len(added) == 1
+                else f"Full-Body keyframes added at {len(added)} edited frames.",
+            )
+        else:
+            set_status(
+                node,
+                f"Full-Body keyframe removed at frame {removed[0] + 1}."
+                if len(removed) == 1
+                else f"Full-Body keyframes removed at {len(removed)} frames.",
+            )
 
-    _outside_edit(node, apply)
+
+def _write_constraints(node, d, raw, label, renew=()):
+    """changed constraints and their poses as one undo step"""
+    source = shown_result(node)
+    live = bool(renew) and rig.current(node, source)
+    with hou.undos.group(label):
+        write_doc(node, d)
+        write_raw_poses(node, raw, record=True)
+        if live:
+            types = types_at(d)
+            rig.put_frames(node, source, [f for f in renew if f in types], [f for f in renew if f not in types])
+    if live:
+        _stand_for(node, [f for f in renew if f in raw])
+        _shown.pop(node.sessionId(), None)
 
 
 def update_unapplied(node):
     """unapplied: do the constraints differ from the ones the result was made with"""
     d = read_doc(node)
-    try:
-        unapplied = int(constraints_key(constraints_json(node, d)) != d["result"].get("applied", NO_CONSTRAINTS))
-    except rig.NotReady:
-        _retry.add(node.sessionId())
-        return False
+    unapplied = int(constraints_key(constraints_json(node, d)) != d["result"].get("applied", NO_CONSTRAINTS))
     if node.evalParm("unapplied") != unapplied:
         with hou.undos.disabler():
             node.parm("unapplied").set(unapplied)
@@ -365,7 +414,6 @@ def update_unapplied(node):
                 node.cook()
             except hou.OperationFailed:
                 pass
-    return True
 
 
 def _new_id(d):
@@ -374,53 +422,66 @@ def _new_id(d):
 
 
 def add_constraint(node, ctype, frame, auto=False):
-    d = read_doc(node)
     if not 0 <= frame < doc.total_frames(doc_from_parms(node)):
         set_status(node, f"Frame {frame + 1} is outside the motion.")
         return None
+    _flush(node)
+    sync_poses(node)
+    d = read_doc(node)
     if any(c["type"] == ctype and frame in c["frames"] for c in d["constraints"]):
         return None
-    before = json.loads(json.dumps(d))
+    before = _taken(types_at(d).get(frame, ()))
     entry = {"id": _new_id(d), "type": ctype, "frames": [frame]}
     if auto:
         entry["auto"] = True
     d["constraints"].append(entry)
-    if frame in read_poses(node):
-        _change_constraints(node, before, d, "Add Kimodo constraint")
-    else:
-        write_doc(node, d)
+    raw = dict(_raw_poses(node))
+    had = frame in raw
+    if not had:
+        raw[frame] = raw_pose(base_pose(node, frame))
+    _write_constraints(
+        node, d, raw, "Add Kimodo constraint", [frame] if had and _taken(types_at(d)[frame]) != before else []
+    )
+    _stand_for(node, [frame])
     update_unapplied(node)
     set_status(node, f"{TYPE_LABELS[ctype]} keyframe added at frame {frame + 1}.")
     return entry["id"]
 
 
-def ensure_stash(node):
-    sync_rig(node)
-    if rig.stash(node) is None:
-        with hou.undos.disabler():
-            rig.merge(node, {}, rig.source_tag(node))
-
-
 def delete_constraint(node, cid):
+    _flush(node)
+    sync_poses(node)
     before = read_doc(node)
     gone = [c for c in before["constraints"] if c["id"] == cid]
     if not gone:
         return
     d = dict(before, constraints=[c for c in before["constraints"] if c["id"] != cid])
-    freed = sorted(set(gone[0]["frames"]) - set(constraint_frames(d)))
-    _change_constraints(node, before, d, "Delete Kimodo constraint", freed)
+    was, now = types_at(before), types_at(d)
+    raw = {frame: pose for frame, pose in _raw_poses(node).items() if frame in now}
+    renew = [f for f in gone[0]["frames"] if f not in now or _taken(now[f]) != _taken(was[f])]
+    _write_constraints(node, d, raw, "Delete Kimodo constraint", renew)
     update_unapplied(node)
     set_status(node, f"{TYPE_LABELS[gone[0]['type']]} constraint deleted.")
 
 
 def set_constraint_type(node, cid, ctype):
+    _flush(node)
+    sync_poses(node)
     before = read_doc(node)
     d = json.loads(json.dumps(before))
+    frames = []
     for c in d["constraints"]:
         if c["id"] == cid:
             c["type"] = ctype
             c.pop("auto", None)
-    _change_constraints(node, before, d, "Change Kimodo constraint type", force=True)
+            frames = c["frames"]
+    was, now = types_at(before), types_at(d)
+    raw = dict(_raw_poses(node))
+    for frame in frames:
+        raw.setdefault(frame, raw_pose(base_pose(node, frame)))
+    _write_constraints(
+        node, d, raw, "Change Kimodo constraint type", [f for f in frames if _taken(now[f]) != _taken(was[f])]
+    )
     update_unapplied(node)
     set_status(node, f"Constraint set to {TYPE_LABELS[ctype]}.")
 
@@ -429,7 +490,8 @@ _copied = {}
 
 
 def copy_pose(node, frame):
-    ensure_stash(node)
+    ensure_rig(node)
+    _flush(node)
     _copied.update(keys=rig.keys_at(node, frame), frame=frame)
     set_status(node, f"Pose of frame {frame + 1} copied.")
 
@@ -446,7 +508,9 @@ def paste_pose(node, ctype, frame, keep_root=False):
     if not 0 <= frame < doc.total_frames(doc_from_parms(node)):
         set_status(node, f"Frame {frame + 1} is outside the motion.")
         return None
-    ensure_stash(node)
+    ensure_rig(node)
+    _flush(node)
+    sync_poses(node)
     names = rig.pasted_channels(ctype, keep_root)
     keys = _copied["keys"]
     if isinstance(names, tuple):
@@ -459,14 +523,15 @@ def paste_pose(node, ctype, frame, keep_root=False):
         entry = {"id": _new_id(d), "type": ctype, "frames": [frame]}
         d["constraints"].append(entry)
     entry.pop("auto", None)
-
-    def apply():
-        with hou.undos.group("Paste Kimodo pose"):
-            rig.set_keys(node, frame, keys)
-            write_doc(node, d)
-            write_rig_keep(node, d)
-
-    _outside_edit(node, apply)
+    raw = dict(_raw_poses(node))
+    with hou.undos.group("Paste Kimodo pose"):
+        rig.set_keys(node, frame, keys)
+        pose = rig.pose(node, frame)
+        raw[frame] = raw_pose(constraints.Pose(pose.local_rots, pose.root_position, pose.root_2d))
+        write_doc(node, d)
+        write_raw_poses(node, raw, record=True)
+    _stand_for(node, [frame])
+    _shown.pop(node.sessionId(), None)
     update_unapplied(node)
     what = {"fullbody": "Pose only" if keep_root else "Pose and root", "root2d": "Root"}.get(
         ctype, f"{TYPE_LABELS[ctype]} pose"
@@ -485,151 +550,93 @@ TYPE_LABELS = {
 }
 
 
-def update_auto_constraints(node, only=None):
-    """auto constraints follow the edited frames"""
-    d = read_doc(node)
-    total = doc.total_frames(doc_from_parms(node))
-    try:
-        edited = {f for f in rig.edited_frames(node, only) if 0 <= f < total}
-    except rig.NotReady:
-        _retry.add(node.sessionId())
-        return False
-    constrained = set(constraint_frames(d))
-    added = sorted(edited - constrained)
-    stored = read_poses(node)
-    removed = [
-        c
-        for c in d["constraints"]
-        if c.get("auto")
-        and c["frames"][0] not in edited
-        and c["frames"][0] not in stored
-        and (only is None or c["frames"][0] in only)
-    ]
-    if not added and not removed:
-        return True
-    d["constraints"] = [c for c in d["constraints"] if c not in removed]
-    for f in added:
-        d["constraints"].append({"id": _new_id(d), "type": "fullbody", "frames": [f], "auto": True})
+RESULT = "kimodo_result"
+_results = {}
+_decoded = {}
+
+
+def pack_sample(local_rots, root_positions):
+    """one sample as stored text"""
+    buffer = io.BytesIO()
+    np.savez_compressed(
+        buffer,
+        r=constraints.matrix_to_axis_angle(local_rots).astype(np.float32),
+        p=np.asarray(root_positions, dtype=np.float32),
+    )
+    return base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def _result(node):
+    text = node.parm(RESULT).unexpandedString()
+    if text not in _results:
+        _results.clear()
+        _results[text] = json.loads(text) if text else {"key": "", "samples": []}
+    return _results[text]
+
+
+def store_result(node, samples, key):
     with hou.undos.disabler():
-        write_doc(node, d)
-    update_unapplied(node)
-    if added:
-        set_status(
-            node,
-            f"Full-Body keyframe added at frame {added[0] + 1}."
-            if len(added) == 1
-            else f"Full-Body keyframes added at {len(added)} edited frames.",
+        node.parm(RESULT).set(
+            json.dumps({"key": key, "samples": [pack_sample(*s) for s in samples]}) if samples else ""
         )
-    else:
-        frames = [c["frames"][0] + 1 for c in removed]
-        set_status(
-            node,
-            f"Full-Body keyframe removed at frame {frames[0]}."
-            if len(frames) == 1
-            else f"Full-Body keyframes removed at {len(frames)} frames.",
-        )
-    return True
+    set_result_samples(node)
 
 
-def embed_results(node, paths):
-    """compressed copy of the result files in the node"""
-    stored = {}
-    for path in paths:
-        with open(hou.text.expandString(path), "rb") as f:
-            stored[path] = base64.b64encode(zlib.compress(f.read(), 6)).decode("ascii")
-    with hou.undos.disabler():
-        node.parm("kimodo_results").set(json.dumps(stored))
+def stored_bytes(node):
+    """scene file bytes for the result and the poses"""
+    return len(node.parm(RESULT).unexpandedString()) + len(node.parm("kimodo_poses").unexpandedString())
 
 
-_embedded = {}
-
-
-def result_file(node, path):
-    """the result file, put back from the node's copy if it's missing"""
-    expanded = hou.text.expandString(path)
-    if not path or os.path.isfile(expanded):
-        return expanded
-    text = node.parm("kimodo_results").unexpandedString()
-    if text not in _embedded:
-        _embedded.clear()
-        _embedded[text] = json.loads(text) if text else {}
-    stored = _embedded[text].get(path)
-    if stored is not None:
-        try:
-            os.makedirs(os.path.dirname(expanded), exist_ok=True)
-            with open(expanded + ".restoring", "wb") as f:
-                f.write(zlib.decompress(base64.b64decode(stored)))
-            os.replace(expanded + ".restoring", expanded)
-        except OSError:
-            pass
-    return expanded
+def stored_note(node):
+    """one line for the node's info window"""
+    samples, poses = len(_result(node)["samples"]), len(_raw_poses(node))
+    result = f"{samples} sample{'s' if samples != 1 else ''}" if samples else "no result"
+    return f"Stored in this node: {result}, {poses} pose{'s' if poses != 1 else ''}, {stored_bytes(node) / 1e6:.2f} MB."
 
 
 def set_result_samples(node):
     """tell the parms how many samples there are"""
-    count = max(len(read_doc(node)["result"]["npz"]), 1)
+    count = max(len(_result(node)["samples"]), 1)
     if node.evalParm("result_samples") != count:
         with hou.undos.disabler():
             node.parm("result_samples").set(count)
 
 
+def _sample_index(node):
+    return min(max(node.evalParm("sample"), 0), len(_result(node)["samples"]) - 1)
+
+
+def _sample_motion(node, index):
+    samples = _result(node)["samples"]
+    if not 0 <= index < len(samples):
+        return None
+    text = samples[index]
+    if text not in _decoded:
+        if len(_decoded) >= 16:
+            _decoded.clear()
+        with np.load(io.BytesIO(base64.b64decode(text))) as z:
+            _decoded[text] = skeleton.motion_from_rotations(
+                constraints.axis_angle_to_matrix(z["r"].astype(np.float64)), z["p"].astype(np.float64)
+            )
+    return _decoded[text]
+
+
+def shown_motion(node):
+    """the shown sample as a Motion, None before the first generate"""
+    return _sample_motion(node, _sample_index(node)) if _result(node)["samples"] else None
+
+
 def shown_result(node):
     """'<request key>:<sample>' of the shown sample, '' while there is none"""
-    paths = read_doc(node)["result"]["npz"]
-    return paths[min(max(node.evalParm("sample"), 0), len(paths) - 1)] if paths else ""
+    result = _result(node)
+    return f"{result['key']}:{_sample_index(node)}" if result["samples"] else ""
 
 
-def sync_rig(node):
-    """rebuild the rig's animation if it was made from another result"""
-    d = read_doc(node)
-    sid = node.sessionId()
-    top = rig.stash(node)
-    current = rig.stash_tag(node)
-    made_from = rig._bake_cache.get(sid)
-    reference = made_from[1] if made_from is not None and made_from[0] == current else None
-    shown = shown_result(node)
-    if node.parm("rig_npz").unexpandedString() != shown:
-        with hou.undos.disabler():
-            node.parm("rig_npz").set(shown)
-    write_rig_keep(node, d)
-    if top is None:
-        return False
-    tag, damaged = rig.source_tag(node), rig.damaged(top)
-    if current == tag and not damaged:
-        return False
-    if current is None and not damaged and is_editing(node):
-        return False
-
-    def apply():
-        with hou.undos.disabler():
-            if damaged:
-                rig.repair(node, current if current is not None else tag)
-                set_status(node, "The stored poses listed the character as removed; that was repaired.")
-            if rig.stash_tag(node) is None:
-                rig.retag(node, rig.source_tag(node))
-            if rig.stash_tag(node) != rig.source_tag(node):
-                capture_poses(node, d, reference)
-                rig.merge(node, {}, rig.source_tag(node))
-                _captured.pop(sid, None)
-
-    _outside_edit(node, apply)
-    return current is not None
-
-
-def _outside_edit(node, fn):
-    viewers = editing_viewers(node)
-    sid = node.sessionId()
-    held = sid in _switching
-    _switching.add(sid)
-    try:
-        leave_state(node)
-        fn()
-    finally:
-        for viewer in viewers:
-            _enter(viewer)
-        _shown.pop(sid, None)
-        if not held:
-            _switching.discard(sid)
+def finish_with(node, samples, text="Done."):
+    """finish a generate with these motions, no service needed"""
+    gen = _GenerateJob(node)
+    gen.finish(text, samples)
+    return gen
 
 
 def import_constraints(node, path):
@@ -642,30 +649,27 @@ def import_constraints(node, path):
             f"{os.path.basename(path)} has constraints up to frame {last + 1}, the motion has "
             f"{doc.total_frames(d)} frames. Increase the duration first."
         )
-    stored = {}
+    raw = {}
     for c in cons:
         for frame, pose in poses[c["id"]].items():
-            if pose.local_rots is not None or frame not in stored:
-                stored[frame] = pose
+            if pose.local_rots is not None or frame not in raw:
+                raw[frame] = raw_pose(pose)
     d["constraints"] = cons
-
-    def apply():
-        with hou.undos.group("Import Kimodo constraints"):
-            write_doc(node, d)
-            write_poses(node, stored)
-            write_rig_keep(node, d)
-            node.parm(rig.STASH).set(hou.Geometry())
-
-    _outside_edit(node, apply)
+    _flush(node)
+    with hou.undos.group("Import Kimodo constraints"):
+        write_doc(node, d)
+        write_raw_poses(node, raw, record=True)
+        node.parm(rig.STASH).set(hou.Geometry())
     update_unapplied(node)
     set_status(node, f"Imported {len(cons)} constraints from {os.path.basename(path)}.")
 
 
 def export_constraints(node, path):
+    _flush(node)
+    sync_poses(node)
     d = read_doc(node)
-    update_auto_constraints(node)
     with open(path, "w") as f:
-        json.dump(constraints_json(node, read_doc(node)), f)
+        json.dump(constraints_json(node, d), f)
     set_status(node, f"Exported {len(d['constraints'])} constraints to {os.path.basename(path)}.")
 
 
@@ -691,21 +695,14 @@ class _GenerateJob:
 
     def __init__(self, node):
         self.node, self.client = node, client.Client(timeout=2.0)
-        sync_rig(node)
-        update_auto_constraints(node)
+        sync_poses(node)
         self.doc = doc_from_parms(node)
         doc.validate(self.doc)
-        stored = capture_poses(node, self.doc)
-        if rig.stash(node) is not None and rig.stash_tag(node) != rig.source_tag(node):
-            with hou.undos.disabler():
-                rig.merge(node, {}, rig.source_tag(node))
-            _captured.pop(node.sessionId(), None)
-        cjson = constraints.to_kimodo_json(self.doc["constraints"], stored.__getitem__)
+        cjson = constraints_json(node, self.doc)
         self.request = client.make_request(self.doc, cjson)
         self.applied = constraints_key(cjson)
-        key = client.cache_key(self.request)
-        self.paths = [f"{CACHE_DIR}/{key}/sample_{i}.npz" for i in range(self.request["num_samples"])]
-        self.request["output_dir"] = os.path.normpath(hou.text.expandString(f"{CACHE_DIR}/{key}"))
+        self.key = client.cache_key(self.request)
+        self.folder = None
         self.job_id, self.started, self.canceled, self.proc = None, time.monotonic(), False, None
         self.warning = "" if abs(hou.fps() - doc.FPS) < 1e-6 else f"Scene is {hou.fps():g} fps, Kimodo is 30 fps. "
 
@@ -715,28 +712,32 @@ class _GenerateJob:
     def fail(self, text, detail=""):
         self.status(text, "error", detail=detail or f"See {client.log_path()}")
 
-    def finish(self, text):
+    def unchanged(self):
+        """same request the result was made with?"""
+        return bool(_result(self.node)["samples"]) and _result(self.node)["key"] == self.key
+
+    def discard_folder(self):
+        if self.folder is not None:
+            shutil.rmtree(self.folder, ignore_errors=True)
+            self.folder = None
+
+    def finish(self, text, samples):
         d = read_doc(self.node)
         d.update({k: self.doc[k] for k in ("model", "prompts", "generation")})
-        d["result"] = {
-            "npz": self.paths,
-            "selected": min(self.node.evalParm("sample"), len(self.paths) - 1),
-            "applied": self.applied,
-        }
+        d["result"] = {"npz": [], "selected": 0, "applied": self.applied}
+        sent = {c["id"] for c in self.doc["constraints"]}
+        for c in d["constraints"]:
+            if c["id"] in sent:
+                c.pop("auto", None)
         with hou.undos.disabler():
             write_doc(self.node, d)
-        embed_results(self.node, self.paths)
-        set_result_samples(self.node)
-        sync_rig(self.node)
+        store_result(self.node, samples, self.key)
         update_unapplied(self.node)
         self.status(text, "done")
 
     def step(self):
         elapsed = time.monotonic() - self.started
         if self.job_id is None:
-            if all(os.path.isfile(result_file(self.node, p)) for p in self.paths):
-                self.finish("Loaded cached result.")
-                return True
             if self.canceled:
                 self.status("Canceled.", "canceled")
                 return True
@@ -754,7 +755,8 @@ class _GenerateJob:
                 self.status(f"Loading models... ({elapsed:.0f} s)", "loading")
                 return False
             self.client.register_session()
-            self.job_id = self.client.generate(self.request)
+            self.folder = tempfile.mkdtemp(prefix="kimodo_")
+            self.job_id = self.client.generate(dict(self.request, output_dir=self.folder))
         if self.canceled:
             self.client.cancel(self.job_id)
         job = self.client.job(self.job_id)
@@ -763,11 +765,16 @@ class _GenerateJob:
             self.status(f"Generating... {job['progress'] * 100:.0f}%", stage, job["progress"])
             return False
         if job["status"] == "done":
-            self.finish(f"Done in {elapsed:.1f} s.")
+            samples = []
+            for path in job["npz"]:
+                with np.load(path) as z:
+                    samples.append((z["local_rot_mats"], z["posed_joints"][:, 0]))
+            self.finish(f"Done in {elapsed:.1f} s.", samples)
         elif job["status"] == "canceled":
             self.status("Canceled.", "canceled")
         else:
             self.fail("Generation failed.", job["error"])
+        self.discard_folder()
         return True
 
 
@@ -785,6 +792,9 @@ def generate(node, wait=False, poll=0.25, timeout=600.0):
         message = e.instanceMessage() if isinstance(e, hou.Error) else str(e)
         set_status(node, "Cannot generate.", "error", detail=message)
         return None
+    if gen.unchanged():
+        set_status(node, gen.warning + "Nothing changed since the last Generate.")
+        return gen
     _running[sid] = gen
     if gen.warning and hou.isUIAvailable():
         hou.ui.setStatusMessage(f"Kimodo Motion ({node.name()}): {gen.warning.strip()}", hou.severityType.Warning)
@@ -848,6 +858,7 @@ def _safe_step(gen):
             gen.fail("Kimodo service stopped while generating. Press Generate to retry.", str(e))
         else:
             gen.fail("Kimodo service error.", str(e))
+        gen.discard_folder()
         return True
 
 
@@ -863,7 +874,6 @@ def cancel(node):
 
 
 ANIMATE_STATE = "apexanimate"
-_switching = set()
 _retry = set()
 _changes = {}
 _watched = {}
@@ -929,7 +939,7 @@ def edit_pose(node):
         set_status(node, "Set the display flag on this node to edit poses.")
         return False
     try:
-        ensure_stash(node)
+        ensure_rig(node)
     except rig.NotReady as e:
         set_status(node, f"The rig is not ready: {e}. Try again.")
         return False
@@ -953,14 +963,11 @@ def end_edit(node):
 def finish_edit(node):
     """bring the node up to date with its poses"""
     sid = node.sessionId()
-    if sid in _switching:
-        return False
     _retry.discard(sid)
     try:
-        if not node.evalParm("busy"):
-            sync_rig(node)
-        update_auto_constraints(node)
-        release_unpinned(node, read_doc(node))
+        if is_editing(node):
+            ensure_rig(node)
+        sync_poses(node)
         update_unapplied(node)
     except rig.NotReady:
         _retry.add(sid)
@@ -968,6 +975,13 @@ def finish_edit(node):
         message = e.instanceMessage() if isinstance(e, hou.Error) else str(e)
         set_status(node, f"Could not read the edited poses: {message}")
     return sid not in _retry
+
+
+def _on_enter_state(state, kwargs):
+    try:
+        ensure_rig(kwargs["node"])
+    except (rig.NotReady, hou.Error):
+        pass
 
 
 INTERRUPTED = "The generation that ran when this scene was saved did not finish. Press Generate."
@@ -994,6 +1008,7 @@ def watch(node):
     if sid in _watched:
         return
     _watched[sid] = [False, -1]
+    node.setCachedUserData("apexanimate:onenter", _on_enter_state)
     _changes.setdefault(sid, 0)
     node.addEventCallback((hou.nodeEventType.ParmTupleChanged,), _on_parm_changed)
     if _poll not in hou.ui.eventLoopCallbacks():
@@ -1093,8 +1108,6 @@ def poll(node):
     """one look at a watched node"""
     sid = node.sessionId()
     seen = _watched[sid]
-    if sid in _switching:
-        return
     viewers = editing_viewers(node)
     if viewers and not node.isDisplayFlagSet():
         leave_state(node)
@@ -1121,33 +1134,21 @@ def poll(node):
     if not editing:
         _shown.pop(sid, None)
         _redo_seen.pop(sid, None)
-    if (seen[0] and not editing) or changes != seen[1] or sid in _retry:
+    stale = editing and not rig.current(node, shown_result(node))
+    if (seen[0] and not editing) or changes != seen[1] or sid in _retry or stale:
         if finish_edit(node):
             seen[1] = _changes.get(sid, 0)
     seen[0] = editing
 
 
-def _motion(path):
-    mtime = os.path.getmtime(path)
-    cached = _motions.get(path)
-    if cached is None or cached[0] != mtime:
-        cached = _motions[path] = (mtime, skeleton.load_motion(path))
-    return cached[1]
-
-
-def _shown_path(node):
-    paths = read_doc(node)["result"]["npz"]
-    return result_file(node, paths[min(max(node.evalParm("sample"), 0), len(paths) - 1)]) if paths else ""
-
-
 def cook(sop):
     """python sop: the shown sample at the current frame"""
     frame = hou.frame()
-    path = _shown_path(sop.parent())
-    if not path:
+    motion = shown_motion(sop.parent())
+    if motion is None:
         skeleton.write_geometry(sop.geometry(), skeleton.rest_positions(), np.tile(np.eye(3).reshape(9), (skeleton.NUM_JOINTS, 1)))
-    elif os.path.isfile(path):
-        skeleton.build_geometry(sop.geometry(), _motion(path), int(round(frame)) - 1)
+    else:
+        skeleton.build_geometry(sop.geometry(), motion, int(round(frame)) - 1)
 
 
 UNAPPLIED_WARNING = "Edited poses not applied. Press Generate."
@@ -1156,20 +1157,15 @@ UNAPPLIED_WARNING = "Edited poses not applied. Press Generate."
 def cook_notice(sop):
     """python sop at the end, raises the asset's warning or error"""
     node = sop.parent()
+    sop.addMessage(stored_note(node))
     error = node.parm("error").unexpandedString()
-    path = _shown_path(node)
     if node.evalParm("unapplied"):
         raise hou.NodeWarning(
             UNAPPLIED_WARNING if not error else f"{UNAPPLIED_WARNING}\nThe last Generate failed.\n{error}"
         )
-    if not path:
-        if error:
+    if error:
+        if not _result(node)["samples"]:
             raise hou.NodeError(error)
-    elif not len(sop.geometry().points()):
-        if error:
-            raise hou.NodeError(error)
-        raise hou.NodeWarning(f"Result file is missing: {path}. Press Generate to recreate it.")
-    elif error:
         raise hou.NodeWarning(f"The last Generate failed; this is the previous result.\n{error}")
 
 
@@ -1182,10 +1178,10 @@ def cook_ghost(sop):
     frame = hou.frame()
     if not node.evalParm("is_posing"):
         return
-    path = _shown_path(node)
-    if os.path.isfile(path):
+    motion = shown_motion(node)
+    if motion is not None:
         geo = sop.geometry()
-        skeleton.build_geometry(geo, _motion(path), int(round(frame)) - 1)
+        skeleton.build_geometry(geo, motion, int(round(frame)) - 1)
         geo.addAttrib(hou.attribType.Point, "Cd", GHOST_COLOR)
 
 
@@ -1194,50 +1190,54 @@ def cook_rest(sop):
     skeleton.build_rest_geometry(sop.geometry())
 
 
-_keep_cache = {}
+def _frame_pose(motion, frame):
+    if motion is None:
+        return np.tile(np.eye(3), (skeleton.NUM_JOINTS, 1, 1)), skeleton.rest_positions()[0]
+    i = min(max(frame, 0), motion.num_frames - 1)
+    return motion.local_rots[i], motion.positions[i, 0].astype(np.float64)
 
 
-def _rig_keep(text):
-    if text not in _keep_cache:
-        _keep_cache.clear()
-        _keep_cache[text] = {int(f): types for f, types in json.loads(text or "{}").items()}
-    return _keep_cache[text]
+def _motion_pose(motion, frame):
+    if motion is None:
+        return skeleton.fk(*_frame_pose(None, frame))
+    i = min(max(frame, 0), motion.num_frames - 1)
+    return motion.positions[i], motion.global_rots[i]
+
+
+def _rig_motion(node):
+    node.evalParm("rig_result")
+    source = node.parm("rig_result").unexpandedString()
+    return _sample_motion(node, int(source.rpartition(":")[2])) if source else None
+
+
+def _write_pose(geo, positions, world, with_root):
+    skeleton.write_geometry(
+        geo, positions, np.swapaxes(world, -1, -2).reshape(skeleton.NUM_JOINTS, 9), with_root=with_root
+    )
+
+
+def _composed(node, motion, frame):
+    """the motion with what the frame's constraints pin taken from its stored pose"""
+    stored, types = read_poses(node).get(frame), _types(node).get(frame)
+    if stored is None or not types:
+        return _motion_pose(motion, frame)
+    local, root = _frame_pose(motion, frame)
+    return skeleton.composed_pose(local, root, stored.local_rots, stored.root_position, stored.root_2d, types)
 
 
 def cook_rig_source(sop):
     """python sop: the motion the rig follows"""
     node = sop.parent()
-    frame = int(round(hou.frame())) - 1
-    node.evalParm("rig_npz")
-    path = result_file(node, node.parm("rig_npz").unexpandedString())
-    stored = read_poses(node).get(frame)
-    types = _rig_keep(node.parm("rig_keep").unexpandedString()).get(frame)
-    if os.path.isfile(path):
-        motion = _motion(path)
-        i = min(max(frame, 0), motion.num_frames - 1)
-        if stored is None:
-            positions, transform = skeleton.pose_arrays(motion, i)
-            return skeleton.write_geometry(sop.geometry(), positions, transform, with_root=True)
-        local, root = motion.local_rots[i], motion.positions[i, 0].astype(np.float64)
-    else:
-        local, root = np.broadcast_to(np.eye(3), (skeleton.NUM_JOINTS, 3, 3)), skeleton.rest_positions()[0]
-    if stored is not None:
-        positions, world = skeleton.composed_pose(
-            local, root, stored.local_rots, stored.root_position, stored.root_2d, types or ()
-        )
-    else:
-        positions, world = skeleton.fk(local, root)
-    skeleton.write_geometry(
-        sop.geometry(), positions, np.swapaxes(world, -1, -2).reshape(skeleton.NUM_JOINTS, 9), with_root=True
-    )
+    _write_pose(sop.geometry(), *_motion_pose(_rig_motion(node), int(round(hou.frame())) - 1), True)
 
 
-def cook_rig_output(sop):
-    """python sop: the rig's pose, shown while constraints are unapplied"""
-    source = sop.inputGeometry(0)
-    geo = sop.geometry()
-    geo.clear()
-    if source is not None and len(source.points()):
-        pose = rig.pose_from_geometry(source)
-        positions, world = skeleton.fk(pose.local_rots, pose.root_position)
-        skeleton.write_geometry(geo, positions, np.swapaxes(world, -1, -2).reshape(skeleton.NUM_JOINTS, 9))
+def cook_pose_source(sop):
+    """python sop: the same motion with the stored poses on their frames"""
+    node = sop.parent()
+    _write_pose(sop.geometry(), *_composed(node, _rig_motion(node), int(round(hou.frame())) - 1), True)
+
+
+def cook_posed(sop):
+    """python sop: the shown result with the stored poses on their frames"""
+    node = sop.parent()
+    _write_pose(sop.geometry(), *_composed(node, shown_motion(node), int(round(hou.frame())) - 1), False)
