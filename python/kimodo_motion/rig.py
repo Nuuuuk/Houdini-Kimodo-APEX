@@ -23,6 +23,10 @@ class NotReady(Exception):
     """the bake is cooking or incomplete, ask again later"""
 
 
+class Interrupted(NotReady):
+    pass
+
+
 def _prim(geo, pick):
     for p in geo.prims():
         if pick(p.attribValue("name")):
@@ -69,12 +73,19 @@ def _cooked(node, name):
     if sid in _baking:
         raise NotReady("the rig is being evaluated")
     _baking.add(sid)
+    inner = node.node(name)
     try:
-        geo = node.node(name).geometry()
-    except (hou.OperationFailed, hou.OperationInterrupted) as e:
+        geo = inner.geometry()
+    except hou.OperationInterrupted:
+        raise Interrupted("converting was interrupted") from None
+    except hou.OperationFailed as e:
+        if "interrupted" in str(e).lower():
+            raise Interrupted("converting was interrupted") from None
         raise NotReady(f"the bake failed: {e}") from None
     finally:
         _baking.discard(sid)
+    if any("interrupted" in error.lower() for error in inner.errors()):
+        raise Interrupted("converting was interrupted")
     if geo is None:
         raise NotReady("the bake has no output")
     return geo
@@ -114,6 +125,11 @@ def base(node, source):
 
 def has_base(node, source):
     return tag_for(node, source) in _bases.get(node.sessionId(), {})
+
+
+def bake_seconds(node, frames):
+    """rough bake time for this many frames"""
+    return frames * 0.012 + (0.0 if _bases.get(node.sessionId()) else 0.9)
 
 
 def frame_keys(node, frames):

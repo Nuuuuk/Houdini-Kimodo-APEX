@@ -208,7 +208,7 @@ class TimelineCanvas(FontSized):
         for c in self.constraints:
             y = ruler_h + (TRACK_TYPES.index(c["type"]) + 1) * row_h + row_h // 2
             frames = c["frames"]
-            color = QtGui.QColor(240, 170, 60) if not c.get("auto") else QtGui.QColor(240, 210, 130)
+            color = QtGui.QColor(*(motion_node.AUTO_MARKER_RGB if c.get("auto") else motion_node.MARKER_RGB))
             p.setPen(QtCore.Qt.NoPen)
             p.setBrush(color)
             if len(frames) > 1 and frames[-1] - frames[0] == len(frames) - 1:
