@@ -325,7 +325,7 @@ IK_JOINTS = tuple(j for limb in LIMBS.values() for j in limb)
 FK_JOINTS = tuple(j for j in JOINT_NAMES if j != "Hips" and j not in IK_JOINTS)
 FK_HIDDEN = tuple(j for j in FK_JOINTS if j.endswith("End") or j in ("Jaw", "LeftEye", "RightEye"))
 FK_CONTROLS = tuple(j for j in FK_JOINTS if j not in FK_HIDDEN)
-ROOT_CONTROL, COG_CONTROL = "Root_ctrl", "COG_ctrl"
+ROOT_CONTROL, PELVIS_CONTROL = "Root_ctrl", "Pelvis_ctrl"
 
 
 def rest_positions():

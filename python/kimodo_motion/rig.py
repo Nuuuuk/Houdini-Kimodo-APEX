@@ -210,7 +210,11 @@ def pinned_controls(ctypes):
         return None
     names = set()
     for ctype in ctypes:
-        names |= ({skeleton.ROOT_CONTROL} if ctype == "root2d" else {_TARGETS[ctype], skeleton.ROOT_CONTROL, skeleton.COG_CONTROL})
+        names |= (
+            {skeleton.ROOT_CONTROL}
+            if ctype == "root2d"
+            else {_TARGETS[ctype], skeleton.ROOT_CONTROL, skeleton.PELVIS_CONTROL}
+        )
     return names
 
 
@@ -247,7 +251,7 @@ CONTROLS_PATH = "/soma.char/Base.rig/"
 
 def pose_controls():
     limbs = [f"{limb}{part}_ik" for limb in skeleton.LIMBS for part in ("Target", "Polevec")]
-    return {skeleton.ROOT_CONTROL, skeleton.COG_CONTROL, *skeleton.FK_CONTROLS, *limbs}
+    return {skeleton.ROOT_CONTROL, skeleton.PELVIS_CONTROL, *skeleton.FK_CONTROLS, *limbs}
 
 
 def _evaluate(node, name, frame):

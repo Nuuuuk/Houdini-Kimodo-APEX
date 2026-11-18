@@ -77,7 +77,6 @@ def set_status(node, text, stage="idle", progress=None, started=None, detail="")
         "elapsed": elapsed,
         "detail": detail,
         "log": client.log_path() if stage == "error" else "",
-        "at": time.monotonic(),
     }
     with hou.undos.disabler():
         node.parm("status").set(text)
@@ -101,31 +100,18 @@ def get_status(node):
             "elapsed": None,
             "detail": error.partition("\n")[2],
             "log": client.log_path() if error else "",
-            "at": None,
         }
     return st
-
-
-MESSAGE_SECONDS = 8.0
-
-
-def status_line(node):
-    """the panel's status line: status while it matters, else a posing hint"""
-    st = get_status(node)
-    recent = st["at"] is not None and time.monotonic() - st["at"] < MESSAGE_SECONDS
-    if st["stage"] in ACTIVE_STAGES or st["stage"] == "error" or recent or st["text"] == INTERRUPTED:
-        return st
-    return dict(st, stage="idle", text=pose_hint(node), progress=None, elapsed=None, detail="", log="")
 
 
 def pose_hint(node):
     """the hint line: how to start posing, or what the posed frame pins"""
     if not is_editing(node):
-        return "Edit Pose, or Enter in the viewer, to pose."
+        return "To pose: hover the viewer and press Enter, or click Edit Pose."
     frame = int(round(hou.frame())) - 1
     d = read_doc(node)
     types = [t for t in doc.CONSTRAINT_TYPES if any(c["type"] == t and frame in c["frames"] for c in d["constraints"])]
-    finish = "Esc or Done to finish."
+    finish = "Esc to finish."
     if not types:
         return f"Posing frame {frame + 1}. {finish}"
     if "fullbody" in types:
@@ -784,7 +770,7 @@ def generate(node, wait=False, poll=0.25, timeout=600.0):
     if sid in _running:
         set_status(node, "Already generating.")
         return None
-    leave_state(node)
+    _flush(node)
     clear_error(node)
     try:
         gen = _GenerateJob(node)
@@ -894,37 +880,8 @@ def editing_viewers(node):
     return sorted(found, key=lambda v: not v.isCurrentTab())
 
 
-def editing_viewer(node):
-    return next(iter(editing_viewers(node)), None)
-
-
-def _in_front(viewer, fn):
-    pane = viewer.pane()
-    front = None if viewer.isCurrentTab() or pane is None else pane.currentTab()
-    if front is not None:
-        viewer.setIsCurrentTab()
-    try:
-        fn()
-    finally:
-        if front is not None:
-            front.setIsCurrentTab()
-
-
-def _leave(viewer):
-    _in_front(viewer, viewer.enterViewState)
-
-
-def _enter(viewer):
-    _in_front(viewer, lambda: viewer.setCurrentState(ANIMATE_STATE))
-
-
-def leave_state(node):
-    for viewer in editing_viewers(node):
-        _leave(viewer)
-
-
 def is_editing(node):
-    return editing_viewer(node) is not None
+    return bool(editing_viewers(node))
 
 
 def edit_pose(node):
@@ -952,12 +909,6 @@ def edit_pose(node):
     except hou.Error:
         pass
     return viewer in editing_viewers(node)
-
-
-def end_edit(node):
-    """leave posing and show the node's own output again"""
-    leave_state(node)
-    finish_edit(node)
 
 
 def finish_edit(node):
@@ -1110,9 +1061,10 @@ def poll(node):
     seen = _watched[sid]
     viewers = editing_viewers(node)
     if viewers and not node.isDisplayFlagSet():
-        leave_state(node)
-        viewers = []
-        set_status(node, "Pose editing ended: the node is no longer displayed.")
+        for viewer in [v for v in viewers if v.isCurrentTab()]:
+            viewer.enterViewState()
+            viewers.remove(viewer)
+            set_status(node, "Pose editing ended: the node is no longer displayed.")
     editing, changes = bool(viewers), _changes.get(sid, 0)
     if bool(node.evalParm("is_posing")) != editing:
         with hou.undos.disabler():
@@ -1164,9 +1116,8 @@ def cook_notice(sop):
             UNAPPLIED_WARNING if not error else f"{UNAPPLIED_WARNING}\nThe last Generate failed.\n{error}"
         )
     if error:
-        if not _result(node)["samples"]:
-            raise hou.NodeError(error)
-        raise hou.NodeWarning(f"The last Generate failed; this is the previous result.\n{error}")
+        shown = "the previous result" if _result(node)["samples"] else "the rest pose, there is no result yet"
+        raise hou.NodeWarning(f"The last Generate failed; this is {shown}.\n{error}")
 
 
 GHOST_COLOR = (0.2, 0.75, 0.6)

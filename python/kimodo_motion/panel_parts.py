@@ -277,6 +277,10 @@ class StatusWidget(QtWidgets.QFrame):
         head.addWidget(self.text, 1)
         head.addWidget(self.elapsed, 0, QtCore.Qt.AlignTop)
         col.addLayout(head)
+        self.hint = QtWidgets.QLabel("")
+        self.hint.setWordWrap(True)
+        self.hint.setStyleSheet(f"color: {STAGE_COLORS['idle']};")
+        col.addWidget(self.hint)
         self.bar = QtWidgets.QProgressBar()
         self.bar.setTextVisible(False)
         self.bar.setFixedHeight(6)
@@ -311,6 +315,10 @@ class StatusWidget(QtWidgets.QFrame):
                 "log": "",
             }
         )
+
+    def show_hint(self, text):
+        if text != self.hint.text():
+            self.hint.setText(text)
 
     def show_status(self, st):
         stage = st["stage"]
@@ -372,28 +380,18 @@ class KimodoPanel(QtWidgets.QWidget):
         self.lower_layout.setSpacing(4)
         self.lower_layout.addWidget(self.status, 0)
         self.edit_button = QtWidgets.QPushButton("Edit Pose")
-        self.edit_button.setCheckable(True)
         self.edit_button.clicked.connect(self.edit_pose)
-        self.done_button = QtWidgets.QPushButton("Done")
-        self.done_button.clicked.connect(self.end_edit)
         self.tips = [
             houdini_tooltip(
                 self.edit_button,
                 "Edit Pose",
                 "Pose the rig in the viewer at the current frame. Enter in the viewer does the same "
-                "while this node is selected.",
+                "while this node is selected; Esc in the viewer ends it.",
                 "Enter",
-            ),
-            houdini_tooltip(
-                self.done_button,
-                "Done",
-                "Leave pose editing in every viewer. Esc in a viewer leaves it in that viewer.",
-                "Esc",
             ),
         ]
         pose_row = QtWidgets.QHBoxLayout()
         pose_row.addWidget(self.edit_button)
-        pose_row.addWidget(self.done_button)
         pose_row.addStretch(1)
         self.lower_layout.addLayout(pose_row, 0)
         self.lower_layout.addStretch(1)
@@ -441,10 +439,8 @@ class KimodoPanel(QtWidgets.QWidget):
         try:
             if self.node is None:
                 return
-            self.status.show_status(motion_node.status_line(self.node))
-            editing = motion_node.is_editing(self.node)
-            self.edit_button.setChecked(editing)
-            self.done_button.setEnabled(editing)
+            self.status.show_status(motion_node.get_status(self.node))
+            self.status.show_hint(motion_node.pose_hint(self.node))
             text = self.node.parm("kimodo_doc").unexpandedString()
             if text != self.doc_text:
                 self.doc_text, self.doc = text, motion_node.read_doc(self.node)
@@ -468,11 +464,6 @@ class KimodoPanel(QtWidgets.QWidget):
     def edit_pose(self):
         if self.node is not None:
             motion_node.edit_pose(self.node)
-            self.refresh()
-
-    def end_edit(self):
-        if self.node is not None:
-            motion_node.end_edit(self.node)
             self.refresh()
 
     def dismiss_error(self):
