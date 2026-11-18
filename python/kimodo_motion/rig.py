@@ -66,7 +66,7 @@ def bake(node):
     _baking.add(sid)
     try:
         geo = node.node(BAKE).geometry()
-    except hou.OperationFailed as e:
+    except (hou.OperationFailed, hou.OperationInterrupted) as e:
         raise NotReady(f"the bake failed: {e}") from None
     finally:
         _baking.discard(sid)
@@ -312,13 +312,17 @@ def _evaluate(node, name, frame):
     _baking.add(sid)
     try:
         geo = node.node(name).geometryAtFrame(frame + 1)
+    except hou.OperationInterrupted:
+        raise NotReady("the rig's evaluation was interrupted") from None
     finally:
         _baking.discard(sid)
     if geo is None or not len(geo.points()):
-        errors = "; ".join(node.node(name).errors())
+        errors = "; ".join(dict.fromkeys(node.node(name).errors()))
         # houdini is cooking the rig for the viewport right now
         if "recursion" in errors.lower():
             raise NotReady("the rig is being evaluated")
+        if "interrupted" in errors.lower():
+            raise NotReady("the rig's evaluation was interrupted")
         raise hou.Error(f"The rig has no pose at frame {frame + 1}: {errors or 'empty output'}")
     return pose_from_geometry(geo)
 

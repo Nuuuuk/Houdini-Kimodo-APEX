@@ -27,10 +27,24 @@ def paste_entries(ctype, frame):
     """[(text, keep the frame's root)] for a track's paste entries"""
     n = frame + 1
     if ctype == "fullbody":
-        return [(f"Paste Pose at Frame {n} with Copied Root", False), (f"Paste Pose at Frame {n}, Keep This Frame's Root", True)]
+        return [(f"Paste Pose and Root at Frame {n}", False), (f"Paste Pose Only at Frame {n}", True)]
     if ctype == "root2d":
-        return [(f"Paste Copied Root at Frame {n}", False)]
-    return [(f"Paste {TRACKS[TRACK_TYPES.index(ctype) + 1]} at Frame {n}, Relative to This Frame's Root", False)]
+        return [(f"Paste Root at Frame {n}", False)]
+    return [(f"Paste Pose at Frame {n}", False)]
+
+
+def houdini_tooltip(widget, title, text, hotkey=""):
+    widget.setProperty("tooltip_text", f"{title}: {text}" + (f" Hotkey: {hotkey}." if hotkey else ""))
+    if not hou.isUIAvailable():
+        widget.setToolTip(text)
+        return None
+    tip = hou.qt.ToolTip()
+    tip.setTitle(title)
+    tip.setText(text)
+    if hotkey:
+        tip.setHotkey(hotkey)
+    tip.setTargetWidget(widget)
+    return tip
 
 
 class Metrics:
@@ -278,7 +292,7 @@ class StatusWidget(QtWidgets.QFrame):
         self.log_link = QtWidgets.QLabel()
         self.log_link.setOpenExternalLinks(True)
         dismiss = QtWidgets.QPushButton("Dismiss")
-        dismiss.setToolTip("Clear the warning or error on the node.")
+        self.tips = [houdini_tooltip(dismiss, "Dismiss", "Clear the warning or error on the node.")]
         dismiss.clicked.connect(self.dismissed)
         actions.addWidget(self.log_link, 1)
         actions.addWidget(dismiss, 0)
@@ -308,6 +322,7 @@ class StatusWidget(QtWidgets.QFrame):
         if shown == self.shown:
             return
         self.shown = shown
+        self.text.setToolTip("")
         self.dot.setStyleSheet(f"background: {STAGE_COLORS.get(stage, '#8a8a8a')}; border-radius: 5px;")
         self.text.setText(st["text"])
         self.elapsed.setText(elapsed)
@@ -358,14 +373,24 @@ class KimodoPanel(QtWidgets.QWidget):
         self.lower_layout.addWidget(self.status, 0)
         self.edit_button = QtWidgets.QPushButton("Edit Pose")
         self.edit_button.setCheckable(True)
-        self.edit_button.setToolTip(
-            "Pose the rig in the viewer at the current frame.\n"
-            "Enter in the viewer, with this node selected, does the same."
-        )
         self.edit_button.clicked.connect(self.edit_pose)
         self.done_button = QtWidgets.QPushButton("Done")
-        self.done_button.setToolTip("Leave pose editing. Esc in the viewer does the same.")
         self.done_button.clicked.connect(self.end_edit)
+        self.tips = [
+            houdini_tooltip(
+                self.edit_button,
+                "Edit Pose",
+                "Pose the rig in the viewer at the current frame. Enter in the viewer does the same "
+                "while this node is selected.",
+                "Enter",
+            ),
+            houdini_tooltip(
+                self.done_button,
+                "Done",
+                "Leave pose editing in every viewer. Esc in a viewer leaves it in that viewer.",
+                "Esc",
+            ),
+        ]
         pose_row = QtWidgets.QHBoxLayout()
         pose_row.addWidget(self.edit_button)
         pose_row.addWidget(self.done_button)
@@ -383,8 +408,18 @@ class KimodoPanel(QtWidgets.QWidget):
         outer.addWidget(self.splitter)
         self.timer = QtCore.QTimer(self)
         self.timer.setInterval(200)
-        self.timer.timeout.connect(self.refresh)
+        self.timer.timeout.connect(self.tick)
         self.timer.start()
+
+    def tick(self):
+        """refresh between cooks, never inside one"""
+        motion_node.when_idle(("panel", id(self)), self.refresh_if_alive)
+
+    def refresh_if_alive(self):
+        try:
+            self.refresh()
+        except RuntimeError:
+            pass
 
     def set_node(self, node):
         self.node = node
@@ -406,7 +441,7 @@ class KimodoPanel(QtWidgets.QWidget):
         try:
             if self.node is None:
                 return
-            self.status.show_status(motion_node.get_status(self.node))
+            self.status.show_status(motion_node.status_line(self.node))
             editing = motion_node.is_editing(self.node)
             self.edit_button.setChecked(editing)
             self.done_button.setEnabled(editing)

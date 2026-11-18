@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import time
 import zlib
 
@@ -27,8 +28,45 @@ def write_doc(node, d):
     node.parm("kimodo_doc").set(doc.dumps(d))
 
 
+def say_once(text):
+    """drops sentences or lines that only repeat an earlier one"""
+    lines = []
+    for line in text.split("\n"):
+        kept, parts = [], []
+        for part in re.split(r"(?<=[.;])\s+", line):
+            words = " ".join(re.findall(r"\w+", part.lower()))
+            if words and not any(k == words or k.endswith(" " + words) for k in kept):
+                kept.append(words)
+                parts.append(part.strip())
+        if not parts:
+            parts = [""] if lines and lines[-1] else []
+        if parts and (not lines or " ".join(parts) != lines[-1]):
+            lines.append(" ".join(parts))
+    return "\n".join(lines)
+
+
+_posted = set()
+
+
+# houdini keeps timers running while it cooks, so node work waits for idle
+def when_idle(key, fn):
+    """run fn from the event queue, between cooks, once per key"""
+    if not hou.isUIAvailable():
+        return fn()
+    if key in _posted:
+        return
+    _posted.add(key)
+
+    def run():
+        _posted.discard(key)
+        fn()
+
+    hou.ui.postEventCallback(run)
+
+
 def set_status(node, text, stage="idle", progress=None, started=None, detail=""):
     sid = node.sessionId()
+    text, detail = say_once(text), say_once(detail)
     previous = _status.get(sid, {}).get("stage")
     elapsed = None if started is None or stage in ACTIVE_STAGES else time.monotonic() - started
     _status[sid] = {
@@ -39,6 +77,7 @@ def set_status(node, text, stage="idle", progress=None, started=None, detail="")
         "elapsed": elapsed,
         "detail": detail,
         "log": client.log_path() if stage == "error" else "",
+        "at": time.monotonic(),
     }
     with hou.undos.disabler():
         node.parm("status").set(text)
@@ -62,8 +101,44 @@ def get_status(node):
             "elapsed": None,
             "detail": error.partition("\n")[2],
             "log": client.log_path() if error else "",
+            "at": None,
         }
     return st
+
+
+MESSAGE_SECONDS = 8.0
+
+
+def status_line(node):
+    """the panel's status line: status while it matters, else a posing hint"""
+    st = get_status(node)
+    recent = st["at"] is not None and time.monotonic() - st["at"] < MESSAGE_SECONDS
+    if st["stage"] in ACTIVE_STAGES or st["stage"] == "error" or recent or st["text"] == INTERRUPTED:
+        return st
+    return dict(st, stage="idle", text=pose_hint(node), progress=None, elapsed=None, detail="", log="")
+
+
+def pose_hint(node):
+    """the hint line: how to start posing, or what the posed frame pins"""
+    if not is_editing(node):
+        return "Edit Pose, or Enter in the viewer, to pose."
+    frame = int(round(hou.frame())) - 1
+    d = read_doc(node)
+    types = [t for t in doc.CONSTRAINT_TYPES if any(c["type"] == t and frame in c["frames"] for c in d["constraints"])]
+    finish = "Esc or Done to finish."
+    if not types:
+        return f"Posing frame {frame + 1}. {finish}"
+    if "fullbody" in types:
+        return f"Posing frame {frame + 1}: Full-Body pins the whole pose. {finish}"
+    hands, feet = sum(t.endswith("hand") for t in types), sum(t.endswith("foot") for t in types)
+    parts = [("the hand", "both hands")[hands - 1]] if hands else []
+    parts += [("the foot", "both feet")[feet - 1]] if feet else []
+    parts += ["pelvis", "heading"] if hands or feet else []
+    parts += ["the Root ring's place on the ground"] if "root2d" in types else []
+    labels = [TYPE_LABELS[t] for t in types]
+    names = labels[0] if len(labels) == 1 else ", ".join(labels[:-1]) + " and " + labels[-1]
+    pinned = parts[0] if len(parts) == 1 else ", ".join(parts[:-1]) + " and " + parts[-1]
+    return f"Posing frame {frame + 1}: {names} {'pins' if len(labels) == 1 else 'pin'} {pinned}. {finish}"
 
 
 def clear_error(node):
@@ -224,14 +299,6 @@ def pinned_at(d, frame):
     return rig.pinned_controls(types) if types else None
 
 
-def pinned_note(d, frame):
-    types = [c["type"] for c in d["constraints"] if frame in c["frames"]]
-    if not types or "fullbody" in types:
-        return ""
-    labels = ", ".join(TYPE_LABELS[t] for t in doc.CONSTRAINT_TYPES if t in types)
-    return f"Frame {frame + 1} pins {labels} only"
-
-
 def release_unpinned(node, d):
     """what a frame doesn't pin goes back to the generated motion"""
     keep = {frame: names for frame, names in kept_keys(d).items() if names is not None}
@@ -293,6 +360,11 @@ def update_unapplied(node):
     if node.evalParm("unapplied") != unapplied:
         with hou.undos.disabler():
             node.parm("unapplied").set(unapplied)
+        if hou.isUIAvailable():
+            try:
+                node.cook()
+            except hou.OperationFailed:
+                pass
     return True
 
 
@@ -396,8 +468,10 @@ def paste_pose(node, ctype, frame, keep_root=False):
 
     _outside_edit(node, apply)
     update_unapplied(node)
-    where = ", keeping this frame's root" if keep_root else ""
-    set_status(node, f"Pose of frame {_copied['frame'] + 1} pasted as a {TYPE_LABELS[ctype]} keyframe at frame {frame + 1}{where}.")
+    what = {"fullbody": "Pose only" if keep_root else "Pose and root", "root2d": "Root"}.get(
+        ctype, f"{TYPE_LABELS[ctype]} pose"
+    )
+    set_status(node, f"{what} of frame {_copied['frame'] + 1} pasted at frame {frame + 1}.")
     return entry["id"]
 
 
@@ -445,6 +519,14 @@ def update_auto_constraints(node, only=None):
             f"Full-Body keyframe added at frame {added[0] + 1}."
             if len(added) == 1
             else f"Full-Body keyframes added at {len(added)} edited frames.",
+        )
+    else:
+        frames = [c["frames"][0] + 1 for c in removed]
+        set_status(
+            node,
+            f"Full-Body keyframe removed at frame {frames[0]}."
+            if len(frames) == 1
+            else f"Full-Body keyframes removed at {len(frames)} frames.",
         )
     return True
 
@@ -535,7 +617,7 @@ def sync_rig(node):
 
 
 def _outside_edit(node, fn):
-    viewer = editing_viewer(node)
+    viewers = editing_viewers(node)
     sid = node.sessionId()
     held = sid in _switching
     _switching.add(sid)
@@ -543,10 +625,9 @@ def _outside_edit(node, fn):
         leave_state(node)
         fn()
     finally:
-        if viewer is not None and viewer.isCurrentTab():
-            viewer.setCurrentState(ANIMATE_STATE)
-            _shown.pop(sid, None)
-            _titled.pop(sid, None)
+        for viewer in viewers:
+            _enter(viewer)
+        _shown.pop(sid, None)
         if not held:
             _switching.discard(sid)
 
@@ -730,17 +811,19 @@ def generate(node, wait=False, poll=0.25, timeout=600.0):
 
     last = [0.0]
 
-    def tick():
-        if time.monotonic() - last[0] < poll:
-            return
-        last[0] = time.monotonic()
+    def step():
         try:
             done = _safe_step(gen)
         except hou.ObjectWasDeleted:
             done = True
-        if done:
+        if done and tick in hou.ui.eventLoopCallbacks():
             hou.ui.removeEventLoopCallback(tick)
             finished()
+
+    def tick():
+        if time.monotonic() - last[0] >= poll:
+            last[0] = time.monotonic()
+            when_idle(("generate", sid), step)
 
     hou.ui.addEventLoopCallback(tick)
     return gen
@@ -761,7 +844,10 @@ def _safe_step(gen):
         gen.fail(str(e), f"{gen.client.base}/health did not answer as the Kimodo service.")
         return True
     except (client.ServiceError, OSError) as e:
-        gen.fail("Kimodo service error.", str(e))
+        if gen.job_id is not None and gen.client.health() is None:
+            gen.fail("Kimodo service stopped while generating. Press Generate to retry.", str(e))
+        else:
+            gen.fail("Kimodo service error.", str(e))
         return True
 
 
@@ -802,16 +888,24 @@ def editing_viewer(node):
     return next(iter(editing_viewers(node)), None)
 
 
-def _leave(viewer):
+def _in_front(viewer, fn):
     pane = viewer.pane()
     front = None if viewer.isCurrentTab() or pane is None else pane.currentTab()
     if front is not None:
         viewer.setIsCurrentTab()
     try:
-        viewer.enterViewState()
+        fn()
     finally:
         if front is not None:
             front.setIsCurrentTab()
+
+
+def _leave(viewer):
+    _in_front(viewer, viewer.enterViewState)
+
+
+def _enter(viewer):
+    _in_front(viewer, lambda: viewer.setCurrentState(ANIMATE_STATE))
 
 
 def leave_state(node):
@@ -825,12 +919,12 @@ def is_editing(node):
 
 def edit_pose(node):
     """start posing in the shown scene view"""
-    if is_editing(node):
-        return True
     viewer = next((v for v in scene_viewers() if v.isCurrentTab() and v.pwd() == node.parent()), None)
     if viewer is None:
         set_status(node, f"Show {node.parent().path()} in a Scene View to edit poses.")
         return False
+    if viewer in editing_viewers(node):
+        return True
     if not node.isDisplayFlagSet():
         set_status(node, "Set the display flag on this node to edit poses.")
         return False
@@ -847,7 +941,7 @@ def edit_pose(node):
         show_pinned_controls(node, viewer)
     except hou.Error:
         pass
-    return is_editing(node)
+    return viewer in editing_viewers(node)
 
 
 def end_edit(node):
@@ -885,6 +979,9 @@ def node_ready(node):
         set_busy(node, False)
         with hou.undos.disabler():
             node.parm("status").set(INTERRUPTED)
+    if node.evalParm("is_posing"):
+        with hou.undos.disabler():
+            node.parm("is_posing").set(0)
     set_result_samples(node)
     watch(node)
 
@@ -915,9 +1012,12 @@ _last_poll = [0.0]
 def _poll():
     """one look at a watched node"""
     now = time.monotonic()
-    if now - _last_poll[0] < WATCH_INTERVAL:
-        return
-    _last_poll[0] = now
+    if now - _last_poll[0] >= WATCH_INTERVAL:
+        _last_poll[0] = now
+        when_idle("watch", _poll_watched)
+
+
+def _poll_watched():
     for sid in list(_watched):
         node = hou.nodeBySessionId(sid)
         if node is None:
@@ -934,19 +1034,24 @@ def show_pinned_controls(node, viewer):
     import apex.control_2 as ac
     import apex.ui.statecommandutils as scu
 
-    sid = node.sessionId()
+    shown = _shown.setdefault(node.sessionId(), {})
     everything = rig.pose_controls()
     pinned = pinned_at(read_doc(node), int(round(hou.frame())) - 1)
     pinned = everything if pinned is None else pinned
-    hide = bool(node.evalParm("unpinned_controls"))
-    visible = pinned if hide else everything
-    disabled = {rig.CONTROLS_PATH + name for name in (set() if hide else everything - pinned)}
-    scene = scu.getAnimateState(viewer).scene
+    dim = bool(node.evalParm("show_unpinned"))
+    visible = everything if dim else pinned
+    disabled = {rig.CONTROLS_PATH + name for name in (everything - pinned if dim else set())}
+    state = scu.getAnimateState(viewer)
+    scene = state.scene
+    for path, control in scene.control_manager.controls.items():
+        name = path.rsplit("/", 1)[-1]
+        if name in everything and bool(control.node_properties.get("selectable", True)) != (name in pinned):
+            control.node_properties["selectable"] = name in pinned
     templates = [t for t in (scene.getData(f"{path}/control_template") for path in scene.findDataPaths("*.rig")) if t is not None]
     current = {path for t in templates for path in ac.getEnabledControlsFromTemplate(t, invert=True)}
-    if _shown.get(sid) == frozenset(visible) and current == disabled:
+    if shown.get(viewer.name()) == frozenset(visible) and current == disabled:
         return
-    if _shown.get(sid) != frozenset(visible):
+    if shown.get(viewer.name()) != frozenset(visible):
         viewer.runStateCommand(
             "showControls",
             {
@@ -959,31 +1064,15 @@ def show_pinned_controls(node, viewer):
         for template in templates:
             ac.setControlTemplateEnabled(template, sorted(current - disabled), True)
             ac.setControlTemplateEnabled(template, sorted(disabled), False)
-        viewer.curViewport().draw()
-    selected = list(scu.getAnimateState(viewer).control_selection)
+        state.runSceneCallbacks(force=True)
+    selected = list(state.control_selection)
     still = [path for path in selected if path.rsplit("/", 1)[-1] in pinned]
     if len(still) != len(selected):
         viewer.runStateCommand(
             "selectControls",
             {"controls": still, "controls_in_tree_format": False, "pick_modifier": hou.pickModifier.Replace},
         )
-    _shown[sid] = frozenset(visible)
-
-
-HUD_PREFIX = "apexanimate:hudtitleprefix"
-_titled = {}
-
-
-def show_hint_title(node, viewer):
-    """posing info in the title of the state's hints"""
-    import apex.ui.statecommandutils as scu
-
-    note = pinned_note(read_doc(node), int(round(hou.frame())) - 1)
-    text = (f"{note}  |  " if note else "") + "Esc exits  |  "
-    if _titled.get(node.sessionId()) != text:
-        node.setCachedUserData(HUD_PREFIX, text)
-        scu.getAnimateState(viewer).updateHUD()
-        _titled[node.sessionId()] = text
+    shown[viewer.name()] = frozenset(visible)
 
 
 _redo_seen = {}
@@ -1007,27 +1096,30 @@ def poll(node):
     if sid in _switching:
         return
     viewers = editing_viewers(node)
-    displayed = node.isDisplayFlagSet()
-    for viewer in [v for v in viewers if not displayed or not v.isCurrentTab()]:
-        _leave(viewer)
-        viewers.remove(viewer)
-        set_status(
-            node,
-            "Pose editing ended: "
-            + ("its Scene View tab is no longer shown." if displayed else "the node is no longer displayed."),
-        )
-    viewer = viewers[0] if viewers else None
-    editing, changes = viewer is not None, _changes.get(sid, 0)
-    if editing:
-        try:
+    if viewers and not node.isDisplayFlagSet():
+        leave_state(node)
+        viewers = []
+        set_status(node, "Pose editing ended: the node is no longer displayed.")
+    editing, changes = bool(viewers), _changes.get(sid, 0)
+    if bool(node.evalParm("is_posing")) != editing:
+        with hou.undos.disabler():
+            node.parm("is_posing").set(int(editing))
+    front = [v for v in viewers if v.isCurrentTab()]
+    try:
+        for viewer in front:
+            if not viewer.geometryVisibility(node):
+                viewer.setGeometryVisibility(node, True)
+            if viewer.name() not in _shown.get(sid, {}):
+                import apex.ui.statecommandutils as scu
+
+                scu.getAnimateState(viewer).updateHUD()
             show_pinned_controls(node, viewer)
-            show_hint_title(node, viewer)
-            follow_undo(node, viewer)
-        except hou.Error:
-            pass
-    else:
+        if front:
+            follow_undo(node, front[0])
+    except hou.Error:
+        pass
+    if not editing:
         _shown.pop(sid, None)
-        _titled.pop(sid, None)
         _redo_seen.pop(sid, None)
     if (seen[0] and not editing) or changes != seen[1] or sid in _retry:
         if finish_edit(node):
@@ -1052,7 +1144,9 @@ def cook(sop):
     """python sop: the shown sample at the current frame"""
     frame = hou.frame()
     path = _shown_path(sop.parent())
-    if os.path.isfile(path):
+    if not path:
+        skeleton.write_geometry(sop.geometry(), skeleton.rest_positions(), np.tile(np.eye(3).reshape(9), (skeleton.NUM_JOINTS, 1)))
+    elif os.path.isfile(path):
         skeleton.build_geometry(sop.geometry(), _motion(path), int(round(frame)) - 1)
 
 
@@ -1063,19 +1157,36 @@ def cook_notice(sop):
     """python sop at the end, raises the asset's warning or error"""
     node = sop.parent()
     error = node.parm("error").unexpandedString()
-    has_output = len(sop.geometry().points()) > 0
+    path = _shown_path(node)
     if node.evalParm("unapplied"):
         raise hou.NodeWarning(
             UNAPPLIED_WARNING if not error else f"{UNAPPLIED_WARNING}\nThe last Generate failed.\n{error}"
         )
-    if not has_output:
+    if not path:
         if error:
             raise hou.NodeError(error)
-        path = _shown_path(node)
-        if path:
-            raise hou.NodeWarning(f"Result file is missing: {path}. Press Generate to recreate it.")
+    elif not len(sop.geometry().points()):
+        if error:
+            raise hou.NodeError(error)
+        raise hou.NodeWarning(f"Result file is missing: {path}. Press Generate to recreate it.")
     elif error:
         raise hou.NodeWarning(f"The last Generate failed; this is the previous result.\n{error}")
+
+
+GHOST_COLOR = (0.2, 0.75, 0.6)
+
+
+def cook_ghost(sop):
+    """python sop: the generated motion while the rig is posed"""
+    node = sop.parent()
+    frame = hou.frame()
+    if not node.evalParm("is_posing"):
+        return
+    path = _shown_path(node)
+    if os.path.isfile(path):
+        geo = sop.geometry()
+        skeleton.build_geometry(geo, _motion(path), int(round(frame)) - 1)
+        geo.addAttrib(hou.attribType.Point, "Cd", GHOST_COLOR)
 
 
 def cook_rest(sop):
