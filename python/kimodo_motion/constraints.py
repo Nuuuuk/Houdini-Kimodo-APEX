@@ -64,6 +64,18 @@ def heading_of(pose):
     return float(np.cos(angle)), float(np.sin(angle))
 
 
+def same_pose(a, b, position_tol=1e-4, angle_tol=1e-3):
+    (pa, wa), (pb, wb) = fk(a.local_rots, a.root_position), fk(b.local_rots, b.root_position)
+    if np.abs(pa - pb).max() > position_tol:
+        return False
+    if (a.root_2d is None) != (b.root_2d is None) or (
+        a.root_2d is not None and np.abs(np.subtract(a.root_2d, b.root_2d)).max() > position_tol
+    ):
+        return False
+    dot = np.abs(np.sum(_matrix_to_quat(wa) * _matrix_to_quat(wb), axis=-1))
+    return bool((2.0 * np.arccos(np.minimum(dot, 1.0))).max() <= angle_tol)
+
+
 def to_kimodo_json(constraints, pose_source):
     """the doc's constraints as kimodo's json list"""
     out = []

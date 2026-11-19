@@ -194,6 +194,18 @@ def load_motion(path):
     return m
 
 
+def motion_from_rotations(local_rots, root_positions):
+    rest = rest_positions()
+    world = np.array(local_rots, dtype=np.float64)
+    positions = np.zeros(world.shape[:2] + (3,))
+    positions[:, 0] = root_positions
+    for j in range(1, NUM_JOINTS):
+        p = PARENTS[j]
+        world[:, j] = world[:, p] @ world[:, j]
+        positions[:, j] = positions[:, p] + world[:, p] @ (rest[j] - rest[p])
+    return Motion(positions, world, np.asarray(local_rots, dtype=np.float64))
+
+
 def pose_arrays(motion, index):
     """point positions and kinefx transforms for one frame"""
     i = min(max(int(index), 0), motion.num_frames - 1)
@@ -219,6 +231,59 @@ def fk(local_rots, root_position):
         world[j] = world[p] @ world[j]
         positions[j] = positions[p] + world[p] @ (rest[j] - rest[p])
     return positions, world
+
+
+def _hip_line(rotation):
+    rest = rest_positions()
+    line = rotation @ (rest[JOINT_NAMES.index("RightLeg")] - rest[JOINT_NAMES.index("LeftLeg")])
+    length = np.hypot(line[0], line[2])
+    return None if length < 1e-9 else np.array([line[0], line[2]]) / length
+
+
+def with_heading(rotation, like):
+    """rotation turned about y to the heading of like"""
+    mine, wanted = _hip_line(rotation), _hip_line(like)
+    if mine is None or wanted is None:
+        return np.array(rotation, dtype=np.float64)
+    c, s = wanted[0] * mine[0] + wanted[1] * mine[1], wanted[0] * mine[1] - wanted[1] * mine[0]
+    return np.array([[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]]) @ rotation
+
+
+def pinned_pose(base_local, stored_local, stored_root, tips):
+    """base pose with only what hand and foot constraints pin from the stored pose"""
+    local = np.array(base_local, dtype=np.float64)
+    local[0] = with_heading(local[0], stored_local[0])
+    positions, world = fk(local, stored_root)
+    stored_positions, stored_world = fk(stored_local, stored_root)
+    rest = rest_positions()
+    moved = set()
+    for j in range(1, NUM_JOINTS):
+        p = PARENTS[j]
+        if JOINT_NAMES[j] in tips:
+            positions[j], world[j] = stored_positions[j], stored_world[j]
+            moved.add(j)
+        elif p in moved:
+            world[j] = world[p] @ local[j]
+            positions[j] = positions[p] + world[p] @ (rest[j] - rest[p])
+            moved.add(j)
+    return positions, world
+
+
+TIPS = {"left-hand": "LeftHand", "right-hand": "RightHand", "left-foot": "LeftFoot", "right-foot": "RightFoot"}
+
+
+def composed_pose(base_local, base_root, stored_local, stored_root, stored_root_2d, ctypes):
+    """the pose the rig follows on a frame with a stored pose"""
+    if stored_local is not None and ("fullbody" in ctypes or not ctypes):
+        return fk(stored_local, stored_root)
+    tips = {TIPS[ctype] for ctype in ctypes if ctype in TIPS}
+    if stored_local is not None and tips:
+        return pinned_pose(base_local, stored_local, stored_root, tips)
+    x, z = (stored_root[0], stored_root[2]) if stored_root_2d is None else stored_root_2d
+    root = np.array(base_root, dtype=np.float64)
+    if not (np.isnan(x) or np.isnan(z)):
+        root[0], root[2] = x, z
+    return fk(base_local, root)
 
 
 def write_geometry(geo, positions, transform, with_root=False, tags=None):
@@ -260,7 +325,7 @@ IK_JOINTS = tuple(j for limb in LIMBS.values() for j in limb)
 FK_JOINTS = tuple(j for j in JOINT_NAMES if j != "Hips" and j not in IK_JOINTS)
 FK_HIDDEN = tuple(j for j in FK_JOINTS if j.endswith("End") or j in ("Jaw", "LeftEye", "RightEye"))
 FK_CONTROLS = tuple(j for j in FK_JOINTS if j not in FK_HIDDEN)
-ROOT_CONTROL, COG_CONTROL = "Root_ctrl", "COG_ctrl"
+ROOT_CONTROL, PELVIS_CONTROL = "Root_ctrl", "Pelvis_ctrl"
 
 
 def rest_positions():
