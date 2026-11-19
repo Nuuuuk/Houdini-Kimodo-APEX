@@ -31,7 +31,6 @@ class Canvas(panel_parts.TimelineCanvas):
     run_delete_requested = QtCore.Signal(str, object)
     range_requested = QtCore.Signal(str, int, int)
     heading_requested = QtCore.Signal(str, bool)
-    smooth_path_requested = QtCore.Signal(bool)
     play_requested = QtCore.Signal()
     step_requested = QtCore.Signal(int)
     hint_changed = QtCore.Signal(str)
@@ -203,17 +202,12 @@ class Canvas(panel_parts.TimelineCanvas):
             for action in menu.actions():
                 if action.text() == "Delete":
                     actions[action] = lambda: self.run_delete_requested.emit(c["id"], run)
-            if ctype == "root2d":
+            if ctype == "root2d" and c is not None:
                 menu.addSeparator()
-                if c is not None:
-                    heading = menu.addAction("Constrain Heading")
-                    heading.setCheckable(True)
-                    heading.setChecked(bool(c.get("heading")))
-                    actions[heading] = lambda: self.heading_requested.emit(c["id"], not c.get("heading"))
-                smooth = menu.addAction("Smooth Path Through Keyframes")
-                smooth.setCheckable(True)
-                smooth.setChecked(self.smooth_path)
-                actions[smooth] = lambda: self.smooth_path_requested.emit(not self.smooth_path)
+                heading = menu.addAction("Constrain Heading")
+                heading.setCheckable(True)
+                heading.setChecked(bool(c.get("heading")))
+                actions[heading] = lambda: self.heading_requested.emit(c["id"], not c.get("heading"))
             chosen = menu.exec(event.globalPosition().toPoint())
             if chosen in actions:
                 actions[chosen]()
@@ -459,19 +453,14 @@ class Panel(panel_parts.KimodoPanel):
         canvas.run_delete_requested.connect(lambda cid, run: self.edit(timeline_edit.delete_run, cid, run))
         canvas.range_requested.connect(lambda ctype, a, b: self.edit(timeline_edit.add_range, ctype, a, b))
         canvas.heading_requested.connect(lambda cid, on: self.edit(timeline_edit.set_heading, cid, on))
-        canvas.smooth_path_requested.connect(lambda on: self.edit(timeline_edit.set_smooth_path, on))
-        self.hint = QtWidgets.QLabel()
-        self.hint.setWordWrap(True)
-        self.hint.setEnabled(False)
-        self.hint.setMinimumHeight(self.hint.fontMetrics().height())
-        canvas.hint_changed.connect(self.hint.setText)
+        canvas.hint_changed.connect(self.show_hover_hint)
         canvas.play_requested.connect(self.toggle_play)
         canvas.step_requested.connect(lambda step: hou.setFrame(max(int(round(hou.frame())) + step, 1)))
         self.generate_button = QtWidgets.QPushButton("Generate")
         self.generate_button.setToolTip("Generate with the node's settings; Cancel while it runs.")
         self.generate_button.clicked.connect(self.generate_or_cancel)
         row = QtWidgets.QHBoxLayout()
-        row.addWidget(self.hint, 1)
+        row.addStretch(1)
         row.addWidget(self.generate_button, 0, QtCore.Qt.AlignTop)
         self.status.layout().insertLayout(0, row)
         self.guide_key = None
@@ -492,14 +481,23 @@ class Panel(panel_parts.KimodoPanel):
         self.generate_button.setEnabled(node is not None)
         self.generate_button.setText("Cancel" if busy else "Generate")
         if node is None:
-            self.hint.setText("Select a Kimodo Motion node.")
+            self.status.show_hint("Select a Kimodo Motion node.")
         else:
             d = motion_node.read_doc(node)
-            self.timeline.canvas.set_smooth_path(bool(d.get("smooth_root_path")))
-            key = (node.parm("kimodo_doc").unexpandedString(), node.parm("kimodo_poses").unexpandedString())
+            self.timeline.canvas.set_smooth_path(bool(node.evalParm("smooth_root_path")))
+            key = (
+                node.parm("kimodo_doc").unexpandedString(),
+                node.parm("kimodo_poses").unexpandedString(),
+                node.evalParm("smooth_root_path"),
+            )
             if key != self.guide_key:
                 self.guide_key = key
                 timeline_edit.update_root_path_guide(node)
+
+    def show_hover_hint(self, text):
+        self.hover_hint = text
+        if self.node is not None:
+            self.status.show_hint(text or motion_node.pose_hint(self.node))
 
     def on_playbar(self, event_type, frame):
         if event_type == hou.playbarEvent.FrameChanged:

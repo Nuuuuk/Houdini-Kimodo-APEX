@@ -269,7 +269,7 @@ def constraints_json(node, d):
         )
 
     cjson = constraints.to_kimodo_json(d["constraints"], pose)
-    return rootpath.apply(cjson) if d.get("smooth_root_path") else cjson
+    return rootpath.apply(cjson) if node.evalParm("smooth_root_path") else cjson
 
 
 def constraints_key(cjson):
@@ -962,7 +962,7 @@ _changes = {}
 _watched = {}
 _shown = {}
 _ended = set()
-WATCHED_PARMS = ("animation", "kimodo_doc", "kimodo_poses", "sample")
+WATCHED_PARMS = ("animation", "kimodo_doc", "kimodo_poses", "sample", "smooth_root_path")
 WATCH_INTERVAL = 0.1
 
 

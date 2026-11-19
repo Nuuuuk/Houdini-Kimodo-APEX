@@ -20,6 +20,7 @@ STAGE_COLORS = {
     "canceled": "#8a8a8a",
     "error": "#d9534f",
 }
+HINT_COLOR = "#a3a3a3"
 
 
 def paste_entries(ctype, frame):
@@ -189,7 +190,7 @@ class StatusWidget(QtWidgets.QFrame):
         col.addLayout(head)
         self.hint = QtWidgets.QLabel("")
         self.hint.setWordWrap(True)
-        self.hint.setStyleSheet(f"color: {STAGE_COLORS['idle']};")
+        self.hint.setStyleSheet(f"color: {HINT_COLOR};")
         col.addWidget(self.hint)
         self.bar = QtWidgets.QProgressBar()
         self.bar.setTextVisible(False)
@@ -264,6 +265,7 @@ class KimodoPanel(QtWidgets.QWidget):
         super().__init__()
         self.node = None
         self.refreshing = False
+        self.hover_hint = ""
         self.doc_text, self.doc = None, None
         self.parm_editor = None
         self.parm_editor_factory = parm_editor_factory or (lambda node: hou.qt.ParmDialog(node, compact=True))
@@ -329,7 +331,7 @@ class KimodoPanel(QtWidgets.QWidget):
             if self.node is None:
                 return
             self.status.show_status(motion_node.get_status(self.node))
-            self.status.show_hint(motion_node.pose_hint(self.node))
+            self.status.show_hint(self.hover_hint or motion_node.pose_hint(self.node))
             text = self.node.parm("kimodo_doc").unexpandedString()
             if text != self.doc_text:
                 self.doc_text, self.doc = text, motion_node.read_doc(self.node)

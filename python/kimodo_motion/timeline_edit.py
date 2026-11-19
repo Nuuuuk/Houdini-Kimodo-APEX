@@ -119,6 +119,8 @@ def move_run(node, cid, run, delta):
         return False
     c = next(c for c in after["constraints"] if c["id"] == cid)
     c.pop("auto", None)
+    had = motion_node.types_at(before)
+    replaced = sorted(new for new in mapping.values() if new in had and new not in mapping)
     _write_constraints(
         node,
         before,
@@ -126,9 +128,14 @@ def move_run(node, cid, run, delta):
         mapping,
         f"move {motion_node.TYPE_LABELS[c['type']]} constraint to {_span_text(sorted(mapping.values()))}",
     )
-    motion_node.set_status(
-        node, f"{motion_node.TYPE_LABELS[c['type']]} constraint moved to {_span_text(sorted(mapping.values()))}."
-    )
+    text = f"{motion_node.TYPE_LABELS[c['type']]} constraint moved to {_span_text(sorted(mapping.values()))}."
+    if len(replaced) == 1:
+        text += f" Its pose replaced the one already on frame {replaced[0] + 1}."
+    elif replaced:
+        text += (
+            f" Its poses replaced the ones already on {len(replaced)} frames ({replaced[0] + 1} to {replaced[-1] + 1})."
+        )
+    motion_node.set_status(node, text)
     return True
 
 
@@ -172,18 +179,17 @@ def set_heading(node, cid, on):
     )
 
 
-def set_smooth_path(node, on):
+def set_smooth_path(node):
     """callback of smooth 2d root path"""
+    on = bool(node.evalParm("smooth_root_path"))
     _settle(node)
     before = current_doc(node)
     d = copy.deepcopy(before)
     if on:
-        d["smooth_root_path"] = True
         for frame in (0, doc.total_frames(d) - 1):
             timeline.add_keyframe(d, "root2d", frame)
-    else:
-        d.pop("smooth_root_path", None)
     _write_constraints(node, before, d, {}, "smooth 2D Root path " + ("on" if on else "off"))
+    update_root_path_guide(node)
     frames = sorted(f for c in d["constraints"] if c["type"] == "root2d" for f in c["frames"])
     motion_node.set_status(
         node,
@@ -194,7 +200,7 @@ def set_smooth_path(node, on):
 
 
 GUIDE_HEIGHT = 0.005
-MARK, TICK = 0.04, 0.25
+TICK = 0.25
 
 
 def update_root_path_guide(node):
@@ -219,8 +225,8 @@ def cook_root_path(sop):
         return
     shapes, geo = json.loads(text), sop.geometry()
 
-    def polyline(points, closed=False):
-        poly = geo.createPolygon(is_closed=closed)
+    def polyline(points):
+        poly = geo.createPolygon(is_closed=False)
         for x, z in points:
             pt = geo.createPoint()
             pt.setPosition((x, GUIDE_HEIGHT, z))
@@ -228,7 +234,7 @@ def cook_root_path(sop):
 
     for line in shapes["lines"]:
         polyline(line)
-    for x, z in shapes["points"]:
-        polyline([(x - MARK, z), (x, z + MARK), (x + MARK, z), (x, z - MARK)], closed=True)
+    if not sop.parent().evalParm("show_poses"):
+        return
     for x, z, c, s in shapes["headings"]:
         polyline([(x, z), (x + TICK * s, z + TICK * c)])

@@ -1,6 +1,7 @@
 """pose state for kimodo motion: sidefx's apex animate state minus its ui."""
 
 import inspect
+import math
 import re
 
 import hou
@@ -10,7 +11,6 @@ STATE_LABEL = "Kimodo Pose"
 LABELS_KEY = "I"
 LABEL_BOX_COLOR = (0.0, 0.0, 0.0, 0.55)
 BOX_PAD = (9, 4)
-LABEL_BOXES = 48
 UNPINNED_KEY = "U"
 NEEDED_METHODS = (
     "onDraw",
@@ -119,7 +119,7 @@ def _state_class():
         show_unpinned = True
         show_labels = True
         _label_text = None
-        _label_boxes = ()
+        _label_boxes = None
         _title = STATE_LABEL
         _pose_lines = None
         _pose_key = None
@@ -262,66 +262,54 @@ def _state_class():
                     return
                 viewport = self.scene_viewer.curViewport()
                 to_camera = viewport.viewTransform().inverted()
-                boxes = iter(self._label_boxes)
+                boxes = hou.Geometry()
+                texts = []
                 for text, position, frame, color in motion_node.pose_labels(self.scene_node):
                     point = hou.Vector3(position)
                     if frame == current or (point * to_camera)[2] >= 0.0:
                         continue
                     at = viewport.mapToScreen(point)
                     width, height = self._label_text.size(text)
-                    box = next(boxes, None)
-                    if box is not None:
-                        toward, _ = viewport.mapToWorld(at[0], at[1])
+                    toward, _ = viewport.mapToWorld(at[0], at[1])
 
-                        def on_plane(x, y):
-                            direction, origin = viewport.mapToWorld(x, y)
-                            return origin + direction * ((point - origin).dot(toward) / direction.dot(toward))
+                    def on_plane(x, y):
+                        direction, origin = viewport.mapToWorld(x, y)
+                        return origin + direction * ((point - origin).dot(toward) / direction.dot(toward))
 
-                        across, along = on_plane(at[0] + 100, at[1]) - point, on_plane(at[0], at[1] + 100) - point
-                        meter = across.length() / 100.0
-                        x, y = across.normalized(), along.normalized()
-                        z = x.cross(y)
-                        box.setTransform(
-                            hou.Matrix4(
-                                (
-                                    (x[0], x[1], x[2], 0),
-                                    (y[0], y[1], y[2], 0),
-                                    (z[0], z[1], z[2], 0),
-                                    (point[0], point[1], point[2], 1),
-                                )
-                            )
-                        )
-                        w, h = (width + 2 * BOX_PAD[0]) * meter, (height + 2 * BOX_PAD[1]) * meter
-                        box.setParams(
-                            {
-                                "size": (w, h),
-                                "position": (0.0, 0.0),
-                                "radius": h * 0.3,
-                                "fill": True,
-                                "color": LABEL_BOX_COLOR,
-                            }
-                        )
-                        box.draw(kwargs["draw_handle"])
+                    across = (on_plane(at[0] + 100, at[1]) - point) * 0.01
+                    up = (on_plane(at[0], at[1] + 100) - point) * 0.01
+                    w, h = width / 2.0 + BOX_PAD[0], height / 2.0 + BOX_PAD[1]
+                    r = h * 0.6
+                    corners = ((w - r, h - r, 0), (-w + r, h - r, 90), (-w + r, -h + r, 180), (w - r, -h + r, 270))
+                    outline = [
+                        (cx + r * math.cos(math.radians(a + s)), cy + r * math.sin(math.radians(a + s)))
+                        for cx, cy, a in corners
+                        for s in (0, 30, 60, 90)
+                    ]
+                    boxes.createPolygons([tuple(boxes.createPoints([point + across * x + up * y for x, y in outline]))])
                     shown = hou.Color(tuple(c ** (1 / 2.2) for c in color))
-                    self._label_text.draw(
-                        kwargs["draw_handle"],
+                    texts.append(
                         {
                             "text": text,
                             "color1": shown,
                             "origin": hou.drawableTextOrigin.BottomLeft,
                             "translate": hou.Vector3(at[0] - width / 2.0, at[1] - height * 0.75, 0.0),
-                        },
+                        }
                     )
+                if self._label_boxes is not None:
+                    self._label_boxes.setGeometry(boxes)
+                    self._label_boxes.draw(kwargs["draw_handle"])
+                for params in texts:
+                    self._label_text.draw(kwargs["draw_handle"], params)
             except Exception:
                 pass
 
         def onExit(self, kwargs):
             if self._pose_lines is not None:
                 self._pose_lines.show(False)
-            if self._label_text is not None:
-                self._label_text.show(False)
-            for box in self._label_boxes:
-                box.show(False)
+            for drawable in (self._label_text, self._label_boxes):
+                if drawable is not None:
+                    drawable.show(False)
             return super().onExit(kwargs)
 
         def _toggle_unpinned(self):
@@ -366,15 +354,13 @@ def _state_class():
             self._pose_lines.show(True)
             self._pose_key = None
             self._title = STATE_LABEL
-            try:
-                self._label_boxes = [
-                    hou.Drawable2D(self.scene_viewer, hou.drawable2DType.Rect, f"kimodo_label_box{i}", pickable=False)
-                    for i in range(LABEL_BOXES)
-                ]
-                for box in self._label_boxes:
-                    box.show(True)
-            except Exception:
-                self._label_boxes = ()
+            self._label_boxes = hou.GeometryDrawable(
+                self.scene_viewer,
+                hou.drawableGeometryType.Face,
+                "kimodo_label_boxes",
+                params={"color1": LABEL_BOX_COLOR, "use_cd": False, "fade_factor": 1.0},
+            )
+            self._label_boxes.show(True)
             self._close_panels()
             for parm in kwargs.get("state_parms", {}).values():
                 parm["visible"] = False
