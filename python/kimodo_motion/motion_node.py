@@ -108,7 +108,7 @@ def get_status(node):
 def pose_hint(node):
     """the hint line: how to start posing, or what the posed frame pins"""
     if not is_editing(node):
-        return "To pose: hover the viewer and press Enter, or click Edit Pose."
+        return "To edit pose: hover the viewer and press Enter, or double-click a keyframe marker."
     frame = int(round(hou.frame())) - 1
     d = read_doc(node)
     types = [t for t in doc.CONSTRAINT_TYPES if any(c["type"] == t and frame in c["frames"] for c in d["constraints"])]
@@ -943,9 +943,6 @@ def edit_pose(node):
         return False
     if viewer in editing_viewers(node):
         return True
-    if not node.isDisplayFlagSet():
-        set_status(node, "Set the display flag on this node to edit poses.")
-        return False
     _ended.discard(node.sessionId())
     try:
         ensure_rig(node)
@@ -956,7 +953,7 @@ def edit_pose(node):
         set_status(node, f"The rig is not ready: {e}. Try again.")
         return False
     if viewer.currentNode() != node:
-        node.setCurrent(True, clear_all_selected=True)
+        node.setCurrent(True)
     viewer.setCurrentState(ANIMATE_STATE)
     watch(node)
     try:
@@ -1278,23 +1275,22 @@ MARKER_RGB, AUTO_MARKER_RGB = (240, 170, 60), (240, 210, 130)
 REST_COLOR = (0.33, 0.33, 0.33)
 MAX_POSES = 40
 RUN_STEP = 10
-LABEL_SIZE, LABEL_GAP = 0.09, 0.12
+LABEL_SIZE, LABEL_GAP = 0.072, 0.12
+LABEL_FONT = "$HFS/houdini/fonts/SideFX-SourceSansPro-Regular.ttf"
 CROSS = 0.12
 POSE_FRAME = "pose_frame"
 _label_geo = {}
 
 
-def _limb_joints(ctype):
-    tip = skeleton.TIPS[ctype]
-    limb = next(joints for joints in skeleton.LIMBS.values() if joints[2] == tip)
-    found = {skeleton.JOINT_NAMES.index(j) for j in limb}
+def _pinned_joints(ctype):
+    found = {skeleton.JOINT_NAMES.index(skeleton.TIPS[ctype])}
     for j, p in enumerate(skeleton.PARENTS):
-        if p in found and p != skeleton.JOINT_NAMES.index(limb[0]) and p != skeleton.JOINT_NAMES.index(limb[1]):
+        if p in found:
             found.add(j)
     return found
 
 
-_LIMB_JOINTS = {ctype: _limb_joints(ctype) for ctype in skeleton.TIPS}
+_PINNED_JOINTS = {ctype: _pinned_joints(ctype) for ctype in skeleton.TIPS}
 _BONES = [(p, j) for j, p in enumerate(skeleton.PARENTS) if p >= 0]
 
 
@@ -1330,7 +1326,9 @@ def _label(text):
             _label_geo.clear()
         geo = hou.Geometry()
         verb = hou.sopNodeTypeCategory().nodeVerb("font")
-        verb.setParms({"text": text, "fontsize": LABEL_SIZE, "halign": 1, "valign": 0})
+        verb.setParms(
+            {"text": text, "file": hou.text.expandString(LABEL_FONT), "fontsize": LABEL_SIZE, "halign": 1, "valign": 0}
+        )
         verb.execute(geo, [])
         _label_geo[text] = geo.freeze()
     return _label_geo[text]
@@ -1371,7 +1369,7 @@ def cook_poses(sop):
         pinned = (
             set(range(skeleton.NUM_JOINTS))
             if "fullbody" in ctypes
-            else set().union(*(_LIMB_JOINTS.get(t, set()) for t in ctypes))
+            else set().union(*(_PINNED_JOINTS.get(t, set()) for t in ctypes))
         )
         first = len(points)
         points += positions.tolist()
@@ -1385,7 +1383,7 @@ def cook_poses(sop):
             xform = hou.hmath.buildRotate(0.0, float(turn), 0.0) * hou.hmath.buildTranslate(
                 float(positions[head][0]), float(positions[:, 1].max()) + LABEL_GAP, float(positions[head][2])
             )
-            labels.append((f"{names} {frame + 1}", xform, color(frame), frame))
+            labels.append((f"{names} @ {frame + 1}", xform, color(frame), frame))
 
     def root(frame):
         pose = stored.get(frame)
@@ -1418,7 +1416,9 @@ def cook_poses(sop):
                 flat = hou.hmath.buildRotate(-90.0, 0.0, 0.0) * hou.hmath.buildTranslate(
                     x, 0.0, z + CROSS + LABEL_SIZE + 0.04
                 )
-                labels.append((f"{TYPE_LABELS['root2d']} {frame + 1}", flat, color(frame), frame if len(path) == 1 else -1))
+                labels.append(
+                    (f"{TYPE_LABELS['root2d']} @ {frame + 1}", flat, color(frame), frame if len(path) == 1 else -1)
+                )
     if points:
         made = geo.createPoints(points)
         geo.setPointFloatAttribValues("Cd", [v for c in colors for v in c])

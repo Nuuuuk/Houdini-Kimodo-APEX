@@ -379,21 +379,6 @@ class KimodoPanel(QtWidgets.QWidget):
         self.lower_layout.setContentsMargins(0, 0, 0, 0)
         self.lower_layout.setSpacing(4)
         self.lower_layout.addWidget(self.status, 0)
-        self.edit_button = QtWidgets.QPushButton("Edit Pose")
-        self.edit_button.clicked.connect(self.edit_pose)
-        self.tips = [
-            houdini_tooltip(
-                self.edit_button,
-                "Edit Pose",
-                "Pose the rig in the viewer at the current frame. Enter in the viewer does the same "
-                "while this node is selected; Esc in the viewer ends it.",
-                "Enter",
-            ),
-        ]
-        pose_row = QtWidgets.QHBoxLayout()
-        pose_row.addWidget(self.edit_button)
-        pose_row.addStretch(1)
-        self.lower_layout.addLayout(pose_row, 0)
         self.lower_layout.addStretch(1)
         self.splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
         self.splitter.addWidget(self.timeline)
