@@ -909,7 +909,18 @@ def cancel(node):
         gen.status("Canceling...", "canceling")
 
 
-ANIMATE_STATE = "apexanimate"
+ANIMATE_STATE = "kimodo_pose"
+# sidefx's own state, a viewer in it on our node poses it too
+STOCK_STATE = "apexanimate"
+POSE_STATE_PROBLEM = None
+_watch_errors = {}
+
+
+def pose_state():
+    """the state that poses a kimodo node: ours, or sidefx's if ours didn't load"""
+    return ANIMATE_STATE if not hou.isUIAvailable() or POSE_STATE_PROBLEM is not None else STOCK_STATE
+
+
 _retry = set()
 _changes = {}
 _watched = {}
@@ -927,7 +938,7 @@ def editing_viewers(node):
     """scene viewers posing this node, shown ones first"""
     if not hou.isUIAvailable():
         return []
-    found = [v for v in scene_viewers() if v.currentState() == ANIMATE_STATE and v.currentNode() == node]
+    found = [v for v in scene_viewers() if v.currentState() in (pose_state(), STOCK_STATE) and v.currentNode() == node]
     return sorted(found, key=lambda v: not v.isCurrentTab())
 
 
@@ -954,7 +965,7 @@ def edit_pose(node):
         return False
     if viewer.currentNode() != node:
         node.setCurrent(True)
-    viewer.setCurrentState(ANIMATE_STATE)
+    viewer.setCurrentState(pose_state())
     watch(node)
     try:
         show_pinned_controls(node, viewer)
@@ -999,6 +1010,9 @@ def _end_posing(node):
 def _on_enter_state(state, kwargs):
     node = kwargs["node"]
     _ended.discard(node.sessionId())
+    if POSE_STATE_PROBLEM or pose_state() == STOCK_STATE:
+        why = POSE_STATE_PROBLEM or "the Kimodo pose state could not be registered"
+        set_status(node, f"Posing with SideFX's full animate state: {why}.")
     try:
         ensure_rig(node)
     except rig.Interrupted:
@@ -1119,8 +1133,14 @@ def _poll_watched():
             continue
         try:
             poll(node)
+            _watch_errors.pop(sid, None)
         except hou.ObjectWasDeleted:
             del _watched[sid]
+        except Exception as e:
+            text = f"{type(e).__name__}: {e}"
+            if _watch_errors.get(sid) != text:
+                _watch_errors[sid] = text
+                set_status(node, f"Kimodo could not follow the pose state ({text}).")
 
 
 def show_pinned_controls(node, viewer):
@@ -1136,6 +1156,8 @@ def show_pinned_controls(node, viewer):
     visible = everything if dim else pinned
     disabled = {rig.CONTROLS_PATH + name for name in (everything - pinned if dim else set())}
     state = scu.getAnimateState(viewer)
+    if state is None:
+        return
     scene = state.scene
     for path, control in scene.control_manager.controls.items():
         name = path.rsplit("/", 1)[-1]
@@ -1187,6 +1209,10 @@ def poll(node):
     """one look at a watched node"""
     sid = node.sessionId()
     seen = _watched[sid]
+    if pose_state() == STOCK_STATE:
+        for viewer in scene_viewers():
+            if viewer.isCurrentTab() and viewer.currentState() == ANIMATE_STATE and viewer.currentNode() == node:
+                viewer.setCurrentState(STOCK_STATE)
     viewers = editing_viewers(node)
     if sid in _ended:
         for viewer in [v for v in viewers if v.isCurrentTab()]:
@@ -1206,7 +1232,9 @@ def poll(node):
             if viewer.name() not in _shown.get(sid, {}):
                 import apex.ui.statecommandutils as scu
 
-                scu.getAnimateState(viewer).updateHUD()
+                state = scu.getAnimateState(viewer)
+                if state is not None:
+                    state.updateHUD()
             show_pinned_controls(node, viewer)
         if front:
             follow_undo(node, front[0])
