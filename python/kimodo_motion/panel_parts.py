@@ -9,7 +9,6 @@ from . import doc, motion_node, rig
 
 TRACKS = ("Prompts", "Full-Body", "2D Root", "Left Hand", "Right Hand", "Left Foot", "Right Foot")
 TRACK_TYPES = ("fullbody", "root2d", "left-hand", "right-hand", "left-foot", "right-foot")
-WIDE_ASPECT = 2.2
 
 STAGE_COLORS = {
     "idle": "#8a8a8a",
@@ -55,7 +54,6 @@ class Metrics:
         self.label_w = max(fm.horizontalAdvance(name) for name in TRACKS) + 14
         self.px_per_frame = max(3, round(fm.height() / 5))
         self.tracks_h = self.ruler_h + self.row_h * len(TRACKS)
-        self.wide_min_width = 60 * fm.height()
 
 
 class FontSized(QtWidgets.QWidget):
@@ -374,21 +372,15 @@ class KimodoPanel(QtWidgets.QWidget):
         )
         self.status = StatusWidget()
         self.status.dismissed.connect(self.dismiss_error)
-        self.lower = QtWidgets.QWidget()
-        self.lower_layout = QtWidgets.QVBoxLayout(self.lower)
-        self.lower_layout.setContentsMargins(0, 0, 0, 0)
-        self.lower_layout.setSpacing(4)
-        self.lower_layout.addWidget(self.status, 0)
-        self.lower_layout.addStretch(1)
-        self.splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
-        self.splitter.addWidget(self.timeline)
-        self.splitter.addWidget(self.lower)
-        self.splitter.setChildrenCollapsible(False)
-        self.splitter.setStretchFactor(0, 0)
-        self.splitter.setStretchFactor(1, 1)
-        outer = QtWidgets.QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.addWidget(self.splitter)
+        fixed = QtWidgets.QSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed)
+        self.timeline.setSizePolicy(fixed)
+        self.status.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Maximum)
+        self.stack = QtWidgets.QVBoxLayout(self)
+        self.stack.setContentsMargins(0, 0, 0, 0)
+        self.stack.setSpacing(4)
+        self.stack.addWidget(self.timeline, 0)
+        self.stack.addWidget(self.status, 0)
+        self.stack.addStretch(1)
         self.timer = QtCore.QTimer(self)
         self.timer.setInterval(200)
         self.timer.timeout.connect(self.tick)
@@ -409,8 +401,8 @@ class KimodoPanel(QtWidgets.QWidget):
         if node is not None:
             if self.parm_editor is None:
                 self.parm_editor = self.parm_editor_factory(node)
-                self.lower_layout.takeAt(2)
-                self.lower_layout.addWidget(self.parm_editor, 1)
+                self.stack.takeAt(2)
+                self.stack.addWidget(self.parm_editor, 1)
             else:
                 self.parm_editor.setNode(node)
             motion_node.watch(node)
@@ -455,19 +447,6 @@ class KimodoPanel(QtWidgets.QWidget):
         if self.node is not None:
             motion_node.clear_error(self.node)
             self.refresh()
-
-    def resizeEvent(self, event):
-        w, h = self.width(), self.height()
-        wide = w >= Metrics(self).wide_min_width and w > WIDE_ASPECT * h
-        orientation = QtCore.Qt.Horizontal if wide else QtCore.Qt.Vertical
-        if orientation != self.splitter.orientation():
-            self.splitter.setOrientation(orientation)
-            if wide:
-                self.splitter.setSizes([w * 3 // 5, w * 2 // 5])
-            else:
-                top = self.timeline.minimumSizeHint().height()
-                self.splitter.setSizes([top, max(h - top, 1)])
-        super().resizeEvent(event)
 
     def close_panel(self):
         self.timer.stop()
