@@ -1152,12 +1152,12 @@ def show_pinned_controls(node, viewer):
     everything = rig.pose_controls()
     pinned = pinned_at(read_doc(node), int(round(hou.frame())) - 1)
     pinned = everything if pinned is None else pinned
-    dim = bool(node.evalParm("show_unpinned"))
-    visible = everything if dim else pinned
-    disabled = {rig.CONTROLS_PATH + name for name in (everything - pinned if dim else set())}
     state = scu.getAnimateState(viewer)
     if state is None:
         return
+    dim = bool(getattr(state, "show_unpinned", True))
+    visible = everything if dim else pinned
+    disabled = {rig.CONTROLS_PATH + name for name in (everything - pinned if dim else set())}
     scene = state.scene
     for path, control in scene.control_manager.controls.items():
         name = path.rsplit("/", 1)[-1]
@@ -1303,11 +1303,9 @@ MARKER_RGB, AUTO_MARKER_RGB = (240, 170, 60), (240, 210, 130)
 REST_COLOR = (0.33, 0.33, 0.33)
 MAX_POSES = 40
 RUN_STEP = 10
-LABEL_SIZE, LABEL_GAP = 0.072, 0.12
-LABEL_FONT = "$HFS/houdini/fonts/SideFX-SourceSansPro-Regular.ttf"
 CROSS = 0.12
 POSE_FRAME = "pose_frame"
-_label_geo = {}
+_labels = {}
 
 
 def _pinned_joints(ctype):
@@ -1348,26 +1346,12 @@ def pose_frames(d):
     return {frame: keep[frame] for frame in frames}, len(keep)
 
 
-def _label(text):
-    if text not in _label_geo:
-        if len(_label_geo) > 400:
-            _label_geo.clear()
-        geo = hou.Geometry()
-        verb = hou.sopNodeTypeCategory().nodeVerb("font")
-        verb.setParms(
-            {"text": text, "file": hou.text.expandString(LABEL_FONT), "fontsize": LABEL_SIZE, "halign": 1, "valign": 0}
-        )
-        verb.execute(geo, [])
-        _label_geo[text] = geo.freeze()
-    return _label_geo[text]
-
-
-def _add_label(geo, text, xform, color, frame):
-    label = hou.Geometry(_label(text))
-    label.transform(xform)
-    label.addAttrib(hou.attribType.Point, "Cd", color)
-    label.addAttrib(hou.attribType.Point, POSE_FRAME, frame)
-    geo.merge(label)
+def _pose_root(stored, frame):
+    pose = stored.get(frame)
+    if pose is None:
+        return None
+    x, z = (pose.root_position[0], pose.root_position[2]) if pose.root_2d is None else pose.root_2d
+    return None if np.isnan(x) or np.isnan(z) else (float(x), 0.0, float(z))
 
 
 def cook_poses(sop):
@@ -1379,7 +1363,6 @@ def cook_poses(sop):
         node.evalParm(name)
     if not node.evalParm("show_poses"):
         return
-    with_labels = bool(node.evalParm("show_pose_labels"))
     d = read_doc(node)
     types, stored, motion = types_at(d), read_poses(node), shown_motion(node)
     auto = {f for f in types if all(c.get("auto") for c in d["constraints"] if f in c["frames"])}
@@ -1387,12 +1370,11 @@ def cook_poses(sop):
     def color(frame):
         return tuple(v / 255.0 for v in (AUTO_MARKER_RGB if frame in auto else MARKER_RGB))
 
-    points, colors, frames, lines, labels = [], [], [], [], []
-    head = skeleton.JOINT_NAMES.index("Head")
-    for frame, labeled in pose_frames(d)[0].items():
+    points, colors, frames, lines = [], [], [], []
+    for frame in pose_frames(d)[0]:
         if stored.get(frame) is None:
             continue
-        positions, world = _composed(node, motion, frame)
+        positions, _ = _composed(node, motion, frame)
         ctypes = types[frame]
         pinned = (
             set(range(skeleton.NUM_JOINTS))
@@ -1404,27 +1386,12 @@ def cook_poses(sop):
         colors += [color(frame) if j in pinned else REST_COLOR for j in range(skeleton.NUM_JOINTS)]
         frames += [frame] * skeleton.NUM_JOINTS
         lines += [(first + a, first + b) for a, b in _BONES]
-        if with_labels and labeled:
-            hips = skeleton._hip_line(world[0])
-            turn = 0.0 if hips is None else -np.degrees(np.arctan2(hips[1], -hips[0]))
-            names = " + ".join(TYPE_LABELS[t] for t in doc.CONSTRAINT_TYPES if t in ctypes and t != "root2d")
-            xform = hou.hmath.buildRotate(0.0, float(turn), 0.0) * hou.hmath.buildTranslate(
-                float(positions[head][0]), float(positions[:, 1].max()) + LABEL_GAP, float(positions[head][2])
-            )
-            labels.append((f"{names} @ {frame + 1}", xform, color(frame), frame))
-
-    def root(frame):
-        pose = stored.get(frame)
-        if pose is None:
-            return None
-        x, z = (pose.root_position[0], pose.root_position[2]) if pose.root_2d is None else pose.root_2d
-        return None if np.isnan(x) or np.isnan(z) else (float(x), 0.0, float(z))
 
     for c in d["constraints"]:
         if c["type"] != "root2d":
             continue
         for run in _runs(sorted(c["frames"])):
-            path = [(frame, root(frame)) for frame in run if root(frame) is not None]
+            path = [(frame, _pose_root(stored, frame)) for frame in run if _pose_root(stored, frame) is not None]
             if not path:
                 continue
             first = len(points)
@@ -1439,21 +1406,58 @@ def cook_poses(sop):
                 colors += [color(frame) for frame, _ in path]
                 frames += [-1] * len(path)
                 lines += [tuple(range(first, first + len(path)))]
-            frame, (x, _, z) = path[0]
-            if with_labels and types[frame] == {"root2d"}:
-                flat = hou.hmath.buildRotate(-90.0, 0.0, 0.0) * hou.hmath.buildTranslate(
-                    x, 0.0, z + CROSS + LABEL_SIZE + 0.04
-                )
-                labels.append(
-                    (f"{TYPE_LABELS['root2d']} @ {frame + 1}", flat, color(frame), frame if len(path) == 1 else -1)
-                )
     if points:
         made = geo.createPoints(points)
         geo.setPointFloatAttribValues("Cd", [v for c in colors for v in c])
         geo.setPointIntAttribValues(POSE_FRAME, frames)
         geo.createPolygons([tuple(made[i] for i in line) for line in lines], False)
-    for label in labels:
-        _add_label(geo, *label)
+
+
+def constraint_label(node, frame):
+    """'Left Hand @ 90' and so on"""
+    types = _types(node).get(frame)
+    if not types:
+        return ""
+    return " + ".join(TYPE_LABELS[t] for t in doc.CONSTRAINT_TYPES if t in types) + f" @ {frame + 1}"
+
+
+def pose_labels(node):
+    key = (
+        node.parm("kimodo_doc").unexpandedString(),
+        node.parm("kimodo_poses").unexpandedString(),
+        shown_result(node),
+        node.evalParm("show_poses"),
+    )
+    if key not in _labels:
+        _labels.clear()
+        found = []
+        if key[3]:
+            d = read_doc(node)
+            types, stored, motion = types_at(d), read_poses(node), shown_motion(node)
+            auto = {f for f in types if all(c.get("auto") for c in d["constraints"] if f in c["frames"])}
+
+            def color(frame):
+                return tuple(v / 255.0 for v in (AUTO_MARKER_RGB if frame in auto else MARKER_RGB))
+
+            for frame, labeled in pose_frames(d)[0].items():
+                if labeled and stored.get(frame) is not None:
+                    pelvis = _composed(node, motion, frame)[0][0]
+                    found.append((constraint_label(node, frame), tuple(float(v) for v in pelvis), frame, color(frame)))
+            for c in d["constraints"]:
+                if c["type"] == "root2d":
+                    for run in _runs(sorted(c["frames"])):
+                        path = [frame for frame in run if _pose_root(stored, frame) is not None]
+                        if path and types[path[0]] == {"root2d"}:
+                            found.append(
+                                (
+                                    constraint_label(node, path[0]),
+                                    _pose_root(stored, path[0]),
+                                    path[0] if len(path) == 1 else -1,
+                                    color(path[0]),
+                                )
+                            )
+        _labels[key] = found
+    return _labels[key]
 
 
 def cook_rest(sop):
