@@ -4,9 +4,9 @@ from collections import namedtuple
 
 import numpy as np
 
-from .skeleton import NUM_JOINTS
+from .skeleton import NUM_JOINTS, fk
 
-Pose = namedtuple("Pose", "local_rots root_position")
+Pose = namedtuple("Pose", "local_rots root_position root_2d", defaults=(None,))
 
 SOMA30_IN_77 = (
     0,
@@ -53,6 +53,18 @@ def motion_pose_source(motion):
     return pose
 
 
+def same_pose(a, b, position_tol=1e-4, angle_tol=1e-3):
+    (pa, wa), (pb, wb) = fk(a.local_rots, a.root_position), fk(b.local_rots, b.root_position)
+    if np.abs(pa - pb).max() > position_tol:
+        return False
+    if (a.root_2d is None) != (b.root_2d is None) or (
+        a.root_2d is not None and np.abs(np.subtract(a.root_2d, b.root_2d)).max() > position_tol
+    ):
+        return False
+    dot = np.abs(np.sum(_matrix_to_quat(wa) * _matrix_to_quat(wb), axis=-1))
+    return bool((2.0 * np.arccos(np.minimum(dot, 1.0))).max() <= angle_tol)
+
+
 def to_kimodo_json(constraints, pose_source):
     """the doc's constraints as kimodo's json list"""
     out = []
@@ -64,7 +76,12 @@ def to_kimodo_json(constraints, pose_source):
         if c["type"] in POSE_TYPES:
             entry["local_joints_rot"] = np.stack([matrix_to_axis_angle(p.local_rots) for p in poses]).tolist()
             entry["root_positions"] = root.tolist()
-        entry["smooth_root_2d"] = root[:, [0, 2]].tolist()
+        if c["type"] == "root2d":
+            entry["smooth_root_2d"] = [
+                list(map(float, root[i, [0, 2]] if p.root_2d is None else p.root_2d)) for i, p in enumerate(poses)
+            ]
+        else:
+            entry["smooth_root_2d"] = root[:, [0, 2]].tolist()
         out.append(entry)
     return out
 
