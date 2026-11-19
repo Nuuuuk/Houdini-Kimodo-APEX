@@ -125,8 +125,3 @@ def delete_run(d, cid, run):
     c["frames"] = [f for f in c["frames"] if f not in set(run)]
     if not c["frames"]:
         d["constraints"].remove(c)
-
-
-def freed_frames(before, after):
-    used = {f for c in after["constraints"] for f in c["frames"]}
-    return sorted({f for c in before["constraints"] for f in c["frames"]} - used)

@@ -92,6 +92,7 @@ class TrackLabels(FontSized):
 
 class TimelineCanvas(FontSized):
     add_requested = QtCore.Signal(str)
+    delete_requested = QtCore.Signal(str)
     type_requested = QtCore.Signal(str, str)
     frame_requested = QtCore.Signal(int)
     edit_requested = QtCore.Signal()
@@ -108,6 +109,25 @@ class TimelineCanvas(FontSized):
     def frame_x(self, frame):
         """middle of the frame's cell"""
         return (frame + 0.5) * self.scale()
+
+    def track_menu(self, constraint, ctype, frame):
+        menu, actions = QtWidgets.QMenu(self), {}
+        if constraint is not None:
+            actions[menu.addAction("Copy Pose")] = lambda: self.copy_requested.emit(frame)
+        for text, keep_root in paste_entries(ctype, self.frame):
+            action = menu.addAction(text)
+            action.setEnabled(motion_node.has_copied_pose())
+            actions[action] = lambda keep_root=keep_root: self.paste_requested.emit(ctype, keep_root)
+        if constraint is not None:
+            menu.addSeparator()
+            actions[menu.addAction("Delete")] = lambda: self.delete_requested.emit(constraint["id"])
+            menu.addSeparator()
+            for i, t in enumerate(TRACK_TYPES):
+                if t != constraint["type"]:
+                    actions[menu.addAction(f"Change to {TRACKS[i + 1]}")] = lambda t=t: self.type_requested.emit(
+                        constraint["id"], t
+                    )
+        return menu, actions
 
     def apply_metrics(self):
         super().apply_metrics()
@@ -252,6 +272,7 @@ class KimodoPanel(QtWidgets.QWidget):
         canvas.add_requested.connect(
             lambda ctype: self.with_node(motion_node.add_constraint, ctype, int(round(hou.frame())) - 1)
         )
+        canvas.delete_requested.connect(lambda cid: self.with_node(motion_node.delete_constraint, cid))
         canvas.type_requested.connect(lambda cid, ctype: self.with_node(motion_node.set_constraint_type, cid, ctype))
         canvas.frame_requested.connect(lambda frame: hou.setFrame(frame + 1))
         canvas.edit_requested.connect(self.edit_pose)

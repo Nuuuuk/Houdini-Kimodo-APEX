@@ -491,6 +491,24 @@ def add_constraint(node, ctype, frame, auto=False):
     return entry["id"]
 
 
+def delete_constraint(node, cid):
+    _flush(node)
+    sync_poses(node)
+    before = read_doc(node)
+    gone = [c for c in before["constraints"] if c["id"] == cid]
+    if not gone:
+        return
+    d = dict(before, constraints=[c for c in before["constraints"] if c["id"] != cid])
+    was, now = types_at(before), types_at(d)
+    raw = {frame: pose for frame, pose in _raw_poses(node).items() if frame in now}
+    renew = [f for f in gone[0]["frames"] if f not in now or _taken(now[f]) != _taken(was[f])]
+    _write_constraints(
+        node, d, raw, f"{OWN_UNDO}delete {TYPE_LABELS[gone[0]['type']]} constraint {_at(gone[0]['frames'])}", renew
+    )
+    update_unapplied(node)
+    set_status(node, f"{TYPE_LABELS[gone[0]['type']]} constraint deleted.")
+
+
 def set_constraint_type(node, cid, ctype):
     _flush(node)
     sync_poses(node)
