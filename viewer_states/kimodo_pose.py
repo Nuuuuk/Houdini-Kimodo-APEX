@@ -1,5 +1,8 @@
 """pose state for kimodo motion: sidefx's apex animate state minus its ui."""
 
+import inspect
+import re
+
 import hou
 
 STATE_NAME = "kimodo_pose"
@@ -11,6 +14,7 @@ LABEL_BOXES = 48
 UNPINNED_KEY = "U"
 NEEDED_METHODS = (
     "onDraw",
+    "onDrawInterrupt",
     "onExit",
     "updateHUD",
     "_updateHUDHandleVis",
@@ -24,17 +28,61 @@ NEEDED_METHODS = (
     "_frameSelectedControls",
 )
 NEEDED_FUNCTIONS = ("_buildHudGeneralRows", "bindStateParms", "createViewerStateTemplate", "ANIMATE_TOOL_ICON")
+NEEDED_ATTRIBUTES = (
+    (
+        "apexanimate",
+        "State",
+        (
+            "scene_node",
+            "scene_viewer",
+            "hotkeys",
+            "xform_gadget",
+            "hud_initialized",
+            "hud_parameter_panel",
+            "hud_channel_panel",
+            "is_shift_pressed",
+            "is_ctrl_pressed",
+            "scene",
+            "scene_callbacks",
+        ),
+    ),
+    ("apex.ui.settingshudwidgets", "AnimateSettingsWidget", ("widgethotkey", "hud_window")),
+    ("apex.ui.splitchannelwidget", "SplitChannelWidgetHandler", ("widgethotkey", "hud_window", "is_visible")),
+    ("apex.sceneevaluators", "SceneEvaluator", ("drawables",)),
+    ("apex.scene_2", "SceneShapeOutputDrawable", ("drawable", "data_key", "output_path")),
+)
+
+
+def _sets(cls, name):
+    """do the class's objects have this attribute"""
+    found = re.compile(rf"\bself\.{name}\s*(:[^=\n]*)?=(?!=)")
+    for c in cls.__mro__:
+        if name in vars(c):
+            return True
+        try:
+            if found.search(inspect.getsource(c)):
+                return True
+        except (OSError, TypeError):
+            pass
+    return False
 
 
 def _missing():
     """what of sidefx's animate state this relies on and can't find"""
+    import importlib
+
     try:
+        import apex.scene_2 as scene_2
         import apex.stateutils_2 as asu
         import apex.ui.statecommandutils as scu
         import apex.xformgadget as xformgadget
         import apex.xformgadgetutils as xgu
         import apexanimate
         import stateutils
+
+        classes = [
+            (f"{m}.{c}", getattr(importlib.import_module(m), c, None), names) for m, c, names in NEEDED_ATTRIBUTES
+        ]
     except ImportError as e:
         return [str(e)]
     missing = [f"apexanimate.State.{name}" for name in NEEDED_METHODS if not hasattr(apexanimate.State, name)]
@@ -49,13 +97,18 @@ def _missing():
         (stateutils, "hudHotkeyRef"),
         (stateutils, "hotkeySymbolOrKeyString"),
         (stateutils, "defineHotkey"),
+        (scene_2.SceneShapeOutputDrawable, "update"),
+        (scene_2.Scene, "getGraphOutputData"),
     ):
         if not hasattr(module, name):
             missing.append(f"{module.__name__}.{name}")
+    for label, cls, names in classes:
+        missing += [f"{label}.{name}" for name in names if cls is None or not _sets(cls, name)]
     return missing
 
 
 def _state_class():
+    import apex.scene_2 as scene_2
     import apex.stateutils_2 as asu
     import apex.xformgadgetutils as xgu
     import apexanimate
@@ -68,6 +121,9 @@ def _state_class():
         _label_text = None
         _label_boxes = ()
         _title = STATE_LABEL
+        _pose_lines = None
+        _pose_key = None
+        _pelvis = None
 
         def updateHUD(self):
             unpinned_key = su.hudHotkeyRef(self.hotkeys.toggle_unpinned)
@@ -118,14 +174,85 @@ def _state_class():
                 }
             )
 
+        def _rig_skeletons(self):
+            return [
+                d
+                for cb in self.scene_callbacks.values()
+                for d in cb.drawables
+                if isinstance(d, scene_2.SceneShapeOutputDrawable) and d.data_key.endswith(".skel")
+            ]
+
+        def _show_rig_skeleton(self, show):
+            for skel in self._rig_skeletons():
+                if skel.drawable.visible() != show:
+                    skel.drawable.show(show)
+                    if show:
+                        skel.update(force=True)
+
+        def _draw_pose(self, draw_handle, frame):
+            from kimodo_motion import motion_node, rig, skeleton
+
+            if self._pose_lines is None:
+                return
+            try:
+                colors = motion_node.pose_colors(self.scene_node, frame)
+                self._show_rig_skeleton(colors is None)
+                if colors is None:
+                    return
+                skel = self._rig_skeletons()[0]
+                rig_geo = self.scene.getGraphOutputData(skel.output_path, skel.data_key)
+                node = self.scene_node
+                key = (
+                    frame,
+                    rig_geo.pointFloatAttribValues("P"),
+                    rig_geo.pointFloatAttribValues("transform"),
+                    node.parm("kimodo_doc").unexpandedString(),
+                    motion_node.shown_result(node),
+                )
+                if key != self._pose_key:
+                    self._pose_key = key
+                    positions = motion_node.posed_positions(node, frame, rig.pose_from_geometry(rig_geo))
+                    self._pelvis = hou.Vector3(positions[0])
+                    geo = hou.Geometry()
+                    geo.addAttrib(hou.attribType.Point, "Cd", (1.0, 1.0, 1.0))
+                    points = geo.createPoints(positions.tolist())
+                    geo.createPolygons(
+                        [(points[p], points[j]) for j, p in enumerate(skeleton.PARENTS) if p >= 0], False
+                    )
+                    geo.setPointFloatAttribValues("Cd", [v ** (1 / 2.2) for c in colors for v in c])
+                    self._pose_lines.setGeometry(geo)
+                view = self.scene_viewer.curViewport().viewTransform()
+                eye = hou.Vector3(0.0, 0.0, 0.0) * view
+                toward = (hou.Vector3(0.0, 0.0, 1.0) * view - eye).normalized()
+                nearer = hou.hmath.buildTranslate(toward * (0.001 * (eye - self._pelvis).length()))
+                self._pose_lines.setTransform(skel.drawable.transform() * nearer)
+                self._pose_lines.draw(draw_handle)
+            except Exception as e:
+                self._pose_lines.show(False)
+                self._pose_lines = None
+                self._show_rig_skeleton(True)
+                motion_node.set_status(
+                    self.scene_node,
+                    f"Kimodo could not draw the pose being edited ({type(e).__name__}: {e}); "
+                    "the rig's own skeleton is shown.",
+                )
+
         def onDraw(self, kwargs):
             super().onDraw(kwargs)
+            self._draw_own(kwargs)
+
+        def onDrawInterrupt(self, kwargs):
+            super().onDrawInterrupt(kwargs)
+            self._draw_own(kwargs)
+
+        def _draw_own(self, kwargs):
             if self.scene_node is None:
                 return
+            current = int(round(hou.frame())) - 1
+            self._draw_pose(kwargs["draw_handle"], current)
             try:
                 from kimodo_motion import motion_node
 
-                current = int(round(hou.frame())) - 1
                 label = motion_node.constraint_label(self.scene_node, current)
                 title = f"{STATE_LABEL}: {label}" if label else STATE_LABEL
                 if title != self._title:
@@ -189,6 +316,8 @@ def _state_class():
                 pass
 
         def onExit(self, kwargs):
+            if self._pose_lines is not None:
+                self._pose_lines.show(False)
             if self._label_text is not None:
                 self._label_text.show(False)
             for box in self._label_boxes:
@@ -228,6 +357,14 @@ def _state_class():
             result = super().onEnter(kwargs)
             self._label_text = hou.TextDrawable(self.scene_viewer, "kimodo_pose_labels")
             self._label_text.show(True)
+            self._pose_lines = hou.GeometryDrawable(
+                self.scene_viewer,
+                hou.drawableGeometryType.Line,
+                "kimodo_pose",
+                params={"use_cd": True, "line_width": 2.0},
+            )
+            self._pose_lines.show(True)
+            self._pose_key = None
             self._title = STATE_LABEL
             try:
                 self._label_boxes = [

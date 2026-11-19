@@ -266,7 +266,59 @@ def pinned_pose(base_local, stored_local, stored_root, tips):
             world[j] = world[p] @ local[j]
             positions[j] = positions[p] + world[p] @ (rest[j] - rest[p])
             moved.add(j)
+    for upper, mid, tip in LIMB_INDICES:
+        if JOINT_NAMES[tip] in tips:
+            solve_limb(world, positions, upper, mid, tip)
     return positions, world
+
+
+def rotation_between(a, b):
+    v, c = np.cross(a, b), float(np.dot(a, b))
+    if c < -1.0 + 1e-12:
+        axis = np.cross(a, [1.0, 0.0, 0.0] if abs(a[0]) < 0.9 else [0.0, 1.0, 0.0])
+        axis /= np.linalg.norm(axis)
+        return 2.0 * np.outer(axis, axis) - np.eye(3)
+    k = np.array([[0.0, -v[2], v[1]], [v[2], 0.0, -v[0]], [-v[1], v[0], 0.0]])
+    return np.eye(3) + k + k @ k / (1.0 + c)
+
+
+def solve_limb(world, positions, upper, mid, tip):
+    """exact two bone solve, in place"""
+    rest = rest_positions()
+    bone1, bone2 = rest[mid] - rest[upper], rest[tip] - rest[mid]
+    l1, l2 = np.linalg.norm(bone1), np.linalg.norm(bone2)
+    start, goal = positions[upper], positions[tip]
+    to_goal = goal - start
+    dist = np.linalg.norm(to_goal)
+    if dist < 1e-9:
+        return
+    axis = to_goal / dist
+    dist = min(max(dist, abs(l1 - l2) + 1e-9), l1 + l2)
+    along = (l1 * l1 - l2 * l2 + dist * dist) / (2.0 * dist)
+    out = np.sqrt(max(l1 * l1 - along * along, 0.0))
+    side = positions[mid] - start
+    side -= axis * np.dot(side, axis)
+    if np.linalg.norm(side) < 1e-9:
+        side = world[upper] @ bone1
+        side -= axis * np.dot(side, axis)
+    norm = np.linalg.norm(side)
+    side = side / norm if norm > 1e-9 else np.zeros(3)
+    middle = start + axis * along + side * out
+    end = start + axis * dist
+    was = (world[upper] @ bone1 / l1, world[mid] @ bone2 / l2)
+    now = ((middle - start) / l1, (end - middle) / l2)
+    planes = [np.cross(*bones) for bones in (was, now)]
+    if min(np.linalg.norm(n) for n in planes) > 1e-6:
+        frames = [
+            np.column_stack([bones[0], n / np.linalg.norm(n), np.cross(bones[0], n / np.linalg.norm(n))])
+            for bones, n in zip((was, now), planes)
+        ]
+        turn = frames[1] @ frames[0].T
+    else:
+        turn = rotation_between(was[0], now[0])
+    world[upper] = turn @ world[upper]
+    world[mid] = rotation_between(turn @ was[1], now[1]) @ turn @ world[mid]
+    positions[mid] = middle
 
 
 TIPS = {"left-hand": "LeftHand", "right-hand": "RightHand", "left-foot": "LeftFoot", "right-foot": "RightFoot"}
@@ -321,6 +373,7 @@ LIMBS = {
     "L_leg": ("LeftLeg", "LeftShin", "LeftFoot"),
     "R_leg": ("RightLeg", "RightShin", "RightFoot"),
 }
+LIMB_INDICES = [tuple(JOINT_NAMES.index(j) for j in limb) for limb in LIMBS.values()]
 IK_JOINTS = tuple(j for limb in LIMBS.values() for j in limb)
 FK_JOINTS = tuple(j for j in JOINT_NAMES if j != "Hips" and j not in IK_JOINTS)
 FK_HIDDEN = tuple(j for j in FK_JOINTS if j.endswith("End") or j in ("Jaw", "LeftEye", "RightEye"))

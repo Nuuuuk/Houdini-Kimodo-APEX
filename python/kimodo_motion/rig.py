@@ -304,48 +304,11 @@ def pose_from_geometry(geo):
     points = np.array(geo.pointFloatAttribValues("P")).reshape(-1, 3)
     positions = points[index]
     for upper, mid, tip in _LIMB_INDICES:
-        _solve_limb(world, positions, upper, mid, tip)
+        skeleton.solve_limb(world, positions, upper, mid, tip)
     local = world.copy()
     local[1:] = np.einsum("jba,jbc->jac", world[_PARENTS[1:]], world[1:])
     root_2d = points[names.index(skeleton.ROOT)][[0, 2]] if skeleton.ROOT in names else None
     return constraints.Pose(local, positions[0], root_2d)
 
 
-_REST = skeleton.rest_positions()
 _LIMB_INDICES = [tuple(skeleton.JOINT_NAMES.index(j) for j in limb) for limb in skeleton.LIMBS.values()]
-
-
-def _rotation_between(a, b):
-    v, c = np.cross(a, b), float(np.dot(a, b))
-    if c < -1.0 + 1e-12:
-        axis = np.cross(a, [1.0, 0.0, 0.0] if abs(a[0]) < 0.9 else [0.0, 1.0, 0.0])
-        axis /= np.linalg.norm(axis)
-        return 2.0 * np.outer(axis, axis) - np.eye(3)
-    k = np.array([[0.0, -v[2], v[1]], [v[2], 0.0, -v[0]], [-v[1], v[0], 0.0]])
-    return np.eye(3) + k + k @ k / (1.0 + c)
-
-
-def _solve_limb(world, positions, upper, mid, tip):
-    bone1, bone2 = _REST[mid] - _REST[upper], _REST[tip] - _REST[mid]
-    l1, l2 = np.linalg.norm(bone1), np.linalg.norm(bone2)
-    start, goal = positions[upper], positions[tip]
-    to_goal = goal - start
-    dist = np.linalg.norm(to_goal)
-    if dist < 1e-9:
-        return
-    axis = to_goal / dist
-    dist = min(max(dist, abs(l1 - l2) + 1e-9), l1 + l2)
-    along = (l1 * l1 - l2 * l2 + dist * dist) / (2.0 * dist)
-    out = np.sqrt(max(l1 * l1 - along * along, 0.0))
-    side = positions[mid] - start
-    side -= axis * np.dot(side, axis)
-    if np.linalg.norm(side) < 1e-9:
-        side = world[upper] @ bone1
-        side -= axis * np.dot(side, axis)
-    norm = np.linalg.norm(side)
-    side = side / norm if norm > 1e-9 else np.zeros(3)
-    middle = start + axis * along + side * out
-    end = start + axis * dist
-    world[upper] = _rotation_between(world[upper] @ bone1 / l1, (middle - start) / l1) @ world[upper]
-    world[mid] = _rotation_between(world[mid] @ bone2 / l2, (end - middle) / l2) @ world[mid]
-    positions[mid] = middle

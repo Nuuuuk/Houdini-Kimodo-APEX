@@ -171,6 +171,7 @@ _raw_cache = {}
 _poses_cache = {}
 _types_cache = {}
 _pose_of = {}
+_on_pose = {}
 
 
 def _raw_poses(node):
@@ -305,9 +306,11 @@ def _stand_for(node, frames):
         return
     _, mine = rig.stash_table(node)
     raw, known = _raw_poses(node), _pose_of.setdefault(node.sessionId(), {})
+    on_pose = _on_pose.setdefault(node.sessionId(), {})
     for frame in frames:
         if frame in raw and frame < mine.shape[1]:
             known.setdefault(frame, {})[mine[:, frame].tobytes()] = raw[frame]
+            on_pose[frame] = mine[:, frame].tobytes()
 
 
 @contextlib.contextmanager
@@ -347,6 +350,7 @@ def ensure_rig(node):
         ):
             build()
     _pose_of.pop(node.sessionId(), None)
+    _on_pose.pop(node.sessionId(), None)
     _stand_for(node, list(_raw_poses(node)))
     _shown.pop(node.sessionId(), None)
     before = _before_interruption.pop(node.sessionId(), None)
@@ -362,6 +366,7 @@ def sync_poses(node):
         return
     d = read_doc(node)
     names, mine = rig.stash_table(node)
+    every = mine
     _, base_names, base = rig.base(node, source)
     if names != base_names:
         rows = [names.index(n) for n in base_names if n in names]
@@ -369,7 +374,8 @@ def sync_poses(node):
     posed = np.abs(mine - base).max(axis=0) > rig.EPS
     types, raw = types_at(d), dict(_raw_poses(node))
     known = _pose_of.setdefault(node.sessionId(), {})
-    added, removed = [], []
+    on_pose = _on_pose.setdefault(node.sessionId(), {})
+    added, removed, renew = [], [], []
     for frame in sorted(set(np.nonzero(posed)[0].tolist()) | set(types)):
         if frame >= mine.shape[1]:
             continue
@@ -391,7 +397,20 @@ def sync_poses(node):
                 pose = rig.pose(node, frame)
                 seen[keys] = raw_pose(constraints.Pose(pose.local_rots, pose.root_position, pose.root_2d))
         raw[frame] = seen[keys]
+        ctypes = types.get(frame, set())
+        if (
+            posed[frame]
+            and "fullbody" not in ctypes
+            and ctypes & set(skeleton.TIPS)
+            and every[:, frame].tobytes() != on_pose.get(frame)
+        ):
+            renew.append(frame)
     write_raw_poses(node, raw)
+    if renew:
+        with hou.undos.disabler():
+            rig.put_frames(node, source, renew)
+        _stand_for(node, renew)
+        _shown.pop(node.sessionId(), None)
     if added or removed:
         with hou.undos.disabler():
             write_doc(node, d)
@@ -1300,22 +1319,6 @@ def cook_notice(sop):
         raise hou.NodeWarning(f"The last Generate failed; this is {shown}.\n{error}")
 
 
-GHOST_COLOR = (0.2, 0.75, 0.6)
-
-
-def cook_ghost(sop):
-    """python sop: the generated motion while the rig is posed"""
-    node = sop.parent()
-    if not node.evalParm("is_posing"):
-        return
-    frame = hou.frame()
-    motion = shown_motion(node)
-    if motion is not None:
-        geo = sop.geometry()
-        skeleton.build_geometry(geo, motion, int(round(frame)) - 1)
-        geo.addAttrib(hou.attribType.Point, "Cd", GHOST_COLOR)
-
-
 MARKER_RGB, AUTO_MARKER_RGB = (240, 170, 60), (240, 210, 130)
 REST_COLOR = (0.33, 0.33, 0.33)
 MAX_POSES = 40
@@ -1335,6 +1338,34 @@ def _pinned_joints(ctype):
 
 _PINNED_JOINTS = {ctype: _pinned_joints(ctype) for ctype in skeleton.TIPS}
 _BONES = [(p, j) for j, p in enumerate(skeleton.PARENTS) if p >= 0]
+
+
+def _pose_colors(d, types, frame):
+    """per joint colors of a constraint frame's pose"""
+    ctypes = types.get(frame, set())
+    if not ctypes - {"root2d"}:
+        return None
+    auto = all(c.get("auto") for c in d["constraints"] if frame in c["frames"])
+    marker = tuple(v / 255.0 for v in (AUTO_MARKER_RGB if auto else MARKER_RGB))
+    pinned = (
+        set(range(skeleton.NUM_JOINTS))
+        if "fullbody" in ctypes
+        else set().union(*(_PINNED_JOINTS.get(t, set()) for t in ctypes))
+    )
+    return [marker if j in pinned else REST_COLOR for j in range(skeleton.NUM_JOINTS)]
+
+
+def pose_colors(node, frame):
+    """per joint colors of a constraint frame's pose"""
+    return _pose_colors(read_doc(node), _types(node), frame)
+
+
+def posed_positions(node, frame, rig_pose):
+    """joint positions of a frame's pose as stored when the rig has rig_pose"""
+    local, root = _frame_pose(shown_motion(node), frame)
+    return skeleton.composed_pose(
+        local, root, rig_pose.local_rots, rig_pose.root_position, rig_pose.root_2d, _types(node).get(frame, set())
+    )[0]
 
 
 def _runs(frames):
@@ -1392,15 +1423,9 @@ def cook_poses(sop):
         if stored.get(frame) is None:
             continue
         positions, _ = _composed(node, motion, frame)
-        ctypes = types[frame]
-        pinned = (
-            set(range(skeleton.NUM_JOINTS))
-            if "fullbody" in ctypes
-            else set().union(*(_PINNED_JOINTS.get(t, set()) for t in ctypes))
-        )
         first = len(points)
         points += positions.tolist()
-        colors += [color(frame) if j in pinned else REST_COLOR for j in range(skeleton.NUM_JOINTS)]
+        colors += _pose_colors(d, types, frame)
         frames += [frame] * skeleton.NUM_JOINTS
         lines += [(first + a, first + b) for a, b in _BONES]
 
@@ -1534,9 +1559,3 @@ def cook_pose_source(sop):
     """python sop: the same motion with the stored poses on their frames"""
     node = sop.parent()
     _write_pose(sop.geometry(), *_composed(node, _rig_motion(node), int(round(hou.frame())) - 1), True)
-
-
-def cook_posed(sop):
-    """python sop: the shown result with the stored poses on their frames"""
-    node = sop.parent()
-    _write_pose(sop.geometry(), *_composed(node, shown_motion(node), int(round(hou.frame())) - 1), False)
