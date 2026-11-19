@@ -166,6 +166,47 @@ PARENTS = (
 NUM_JOINTS = len(JOINT_NAMES)
 
 
+def _mixamo_names():
+    names = {
+        "Hips": "Hips",
+        "Spine1": "Spine",
+        "Spine2": "Spine1",
+        "Chest": "Spine2",
+        "Neck1": "Neck",
+        "Neck2": "Neck1",
+        "Head": "Head",
+        "HeadEnd": "HeadTop_End",
+        "Jaw": "Jaw",
+    }
+    for side in ("Left", "Right"):
+        names.update(
+            {
+                f"{side}Eye": f"{side}Eye",
+                f"{side}Shoulder": f"{side}Shoulder",
+                f"{side}Arm": f"{side}Arm",
+                f"{side}ForeArm": f"{side}ForeArm",
+                f"{side}Hand": f"{side}Hand",
+                f"{side}Leg": f"{side}UpLeg",
+                f"{side}Shin": f"{side}Leg",
+                f"{side}Foot": f"{side}Foot",
+                f"{side}ToeBase": f"{side}ToeBase",
+                f"{side}ToeEnd": f"{side}Toe_End",
+            }
+        )
+        thumb = f"{side}HandThumb"
+        names.update(
+            {f"{thumb}1": f"{thumb}1", f"{thumb}2": f"{thumb}2", f"{thumb}3": f"{thumb}3", f"{thumb}End": f"{thumb}4"}
+        )
+        for finger in ("Index", "Middle", "Ring", "Pinky"):
+            base = f"{side}Hand{finger}"
+            names.update({f"{base}{i}": f"{base}{i - 1}" for i in range(1, 5)})
+            names[f"{base}End"] = f"{base}4"
+    return tuple(names[j] for j in JOINT_NAMES)
+
+
+OUTPUT_NAMES = _mixamo_names()
+
+
 class Motion:
     def __init__(self, positions, global_rots, local_rots):
         self.positions = positions
@@ -213,11 +254,11 @@ def pose_arrays(motion, index):
     return motion.positions[i].astype(np.float32), transform.astype(np.float32)
 
 
-def build_geometry(geo, motion, index):
+def build_geometry(geo, motion, index, names=JOINT_NAMES):
     import hou
 
     positions, transform = pose_arrays(motion, index)
-    write_geometry(geo, positions, transform)
+    write_geometry(geo, positions, transform, names=names)
 
 
 def fk(local_rots, root_position):
@@ -338,7 +379,7 @@ def composed_pose(base_local, base_root, stored_local, stored_root, stored_root_
     return fk(base_local, root)
 
 
-def write_geometry(geo, positions, transform, with_root=False, tags=None):
+def write_geometry(geo, positions, transform, with_root=False, tags=None, names=JOINT_NAMES):
     """kinefx skeleton from joint positions and transforms"""
     import hou
 
@@ -346,7 +387,7 @@ def write_geometry(geo, positions, transform, with_root=False, tags=None):
         np.asarray(positions, dtype=np.float64),
         np.asarray(transform, dtype=np.float64).reshape(-1, 9),
     )
-    names = list(JOINT_NAMES)
+    names = list(names)
     if with_root:
         names.append(ROOT)
         positions = np.vstack([positions, [positions[0, 0], 0.0, positions[0, 2]]])
@@ -377,8 +418,56 @@ LIMB_INDICES = [tuple(JOINT_NAMES.index(j) for j in limb) for limb in LIMBS.valu
 IK_JOINTS = tuple(j for limb in LIMBS.values() for j in limb)
 FK_JOINTS = tuple(j for j in JOINT_NAMES if j != "Hips" and j not in IK_JOINTS)
 FK_HIDDEN = tuple(j for j in FK_JOINTS if j.endswith("End") or j in ("Jaw", "LeftEye", "RightEye"))
-FK_CONTROLS = tuple(j for j in FK_JOINTS if j not in FK_HIDDEN)
-ROOT_CONTROL, PELVIS_CONTROL = "Root_ctrl", "Pelvis_ctrl"
+
+
+def _fk_control_names():
+    names = {
+        "Spine1": "C_spine_01",
+        "Spine2": "C_spine_02",
+        "Chest": "C_chest",
+        "Neck1": "C_neck_01",
+        "Neck2": "C_neck_02",
+        "Head": "C_head",
+        "HeadEnd": "C_headEnd",
+        "Jaw": "C_jaw",
+    }
+    for side, s in (("Left", "L"), ("Right", "R")):
+        names.update(
+            {
+                f"{side}Eye": f"{s}_eye",
+                f"{side}Shoulder": f"{s}_clavicle",
+                f"{side}ToeBase": f"{s}_ball",
+                f"{side}ToeEnd": f"{s}_ballEnd",
+            }
+        )
+        for finger in ("Thumb", "Index", "Middle", "Ring", "Pinky"):
+            for j in JOINT_NAMES:
+                if j.startswith(f"{side}Hand{finger}"):
+                    part = j[len(f"{side}Hand{finger}") :]
+                    names[j] = f"{s}_{finger.lower()}End" if part == "End" else f"{s}_{finger.lower()}_{int(part):02d}"
+    return {j: names[j] + "_fk" for j in FK_JOINTS}
+
+
+FK_CONTROL = _fk_control_names()
+FK_CONTROLS = tuple(FK_CONTROL[j] for j in FK_JOINTS if j not in FK_HIDDEN)
+ROOT_CONTROL, PELVIS_CONTROL = "C_root_ctrl", "C_pelvis_ctrl"
+
+
+REST_TRANSFORM = "rest_transform"
+
+
+def rest_transforms():
+    """the rest pose as kinefx rest_transform values"""
+    out = np.tile(np.eye(4), (NUM_JOINTS, 1, 1))
+    out[:, 3, :3] = rest_positions()
+    return out.reshape(NUM_JOINTS, 16)
+
+
+def write_rest_transform(geo):
+    import hou
+
+    geo.addAttrib(hou.attribType.Point, REST_TRANSFORM, tuple(np.eye(4).ravel().tolist()))
+    geo.setPointFloatAttribValues(REST_TRANSFORM, rest_transforms().ravel().tolist())
 
 
 def rest_positions():

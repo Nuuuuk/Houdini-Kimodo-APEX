@@ -121,7 +121,7 @@ def pose_hint(node):
     parts = [("the hand", "both hands")[hands - 1]] if hands else []
     parts += [("the foot", "both feet")[feet - 1]] if feet else []
     parts += ["pelvis", "heading"] if hands or feet else []
-    parts += ["the Root ring's place on the ground"] if "root2d" in types else []
+    parts += ["the Root disk's place on the ground"] if "root2d" in types else []
     labels = [TYPE_LABELS[t] for t in types]
     names = labels[0] if len(labels) == 1 else ", ".join(labels[:-1]) + " and " + labels[-1]
     pinned = parts[0] if len(parts) == 1 else ", ".join(parts[:-1]) + " and " + parts[-1]
@@ -1294,9 +1294,15 @@ def cook(sop):
     frame = hou.frame()
     motion = shown_motion(sop.parent())
     if motion is None:
-        skeleton.write_geometry(sop.geometry(), skeleton.rest_positions(), np.tile(np.eye(3).reshape(9), (skeleton.NUM_JOINTS, 1)))
+        skeleton.write_geometry(
+            sop.geometry(),
+            skeleton.rest_positions(),
+            np.tile(np.eye(3).reshape(9), (skeleton.NUM_JOINTS, 1)),
+            names=skeleton.OUTPUT_NAMES,
+        )
     else:
-        skeleton.build_geometry(sop.geometry(), motion, int(round(frame)) - 1)
+        skeleton.build_geometry(sop.geometry(), motion, int(round(frame)) - 1, names=skeleton.OUTPUT_NAMES)
+    skeleton.write_rest_transform(sop.geometry())
 
 
 UNAPPLIED_WARNING = "Edited poses not applied. Press Generate."
