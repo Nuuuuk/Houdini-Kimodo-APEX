@@ -196,6 +196,92 @@ def _on_stash_changed(node, event_type, **kwargs):
         _foreign[node.sessionId()] = _foreign.get(node.sessionId(), 0) + 1
 
 
+CLIP_PARMS = ("prompt", "duration")
+_clip_edits = {}
+_clip_seen = {}
+_clip_redo = {}
+_clip_labels = {}
+
+
+def _clip_look(node):
+    return (
+        len(hou.undos.undoLabels()),
+        len(hou.undos.redoLabels()),
+        {name: node.parm(name).eval() for name in CLIP_PARMS},
+    )
+
+
+@contextlib.contextmanager
+def clip_write(node):
+    follow_clip_parms(node)
+    try:
+        yield
+    finally:
+        _clip_seen[node.sessionId()] = _clip_look(node)
+
+
+def clip_step_here(node):
+    edits, n = _clip_edits.setdefault(node.sessionId(), {}), len(hou.undos.undoLabels())
+    for k in [k for k in edits if k >= n]:
+        del edits[k]
+    edits[n] = None
+    _clip_labels.setdefault(node.sessionId(), {})[n] = hou.undos.undoLabels()[0] if n else ""
+    _clip_seen[node.sessionId()] = _clip_look(node)
+
+
+def follow_clip_parms(node):
+    sid = node.sessionId()
+    now, seen = _clip_look(node), _clip_seen.get(sid)
+    _clip_seen[sid] = now
+    if seen is None:
+        return
+    (u, r, values), (su, sr, before) = now, seen
+    edits = _clip_edits.setdefault(sid, {})
+    undone, redone = su - u if u < su and r - sr == su - u else 0, u - su if u > su and sr - r == u - su else 0
+    if redone:
+        last, label = edits.get(u), _clip_labels.get(sid, {}).get(u)
+        if label != (hou.undos.undoLabels()[0] if u else ""):
+            redone = 0
+        elif last and values[last[1]] != _clip_redo.get(sid, {}).get(u, last[3]):
+            redone = 0
+    if not undone and not redone and r < sr:
+        for k in [k for k in edits if k > su]:
+            del edits[k]
+    d = read_doc(node)
+    if not d["prompts"]:
+        return
+    ids = [p["id"] for p in d["prompts"]]
+    selected = ids[selected_prompt(node, d)]
+    if undone:
+        puts = [(e[0], e[1], e[2]) for e in (edits.get(k) for k in range(su, u, -1)) if e]
+        for k in range(su, u, -1):
+            if edits.get(k):
+                _clip_redo.setdefault(sid, {})[k] = before[edits[k][1]]
+    elif redone:
+        puts = [(e[0], e[1], e[3]) for e in (edits.get(k) for k in range(su + 1, u + 1)) if e]
+    else:
+        for name in CLIP_PARMS:
+            if values[name] != before[name]:
+                for k in [k for k in edits if k >= u]:
+                    del edits[k]
+                edits[u] = (selected, name, before[name], values[name])
+                _clip_labels.setdefault(sid, {})[u] = hou.undos.undoLabels()[0] if u else ""
+        return
+    puts = [put for put in puts if put[0] in ids]
+    if not puts:
+        return
+    with hou.undos.disabler():
+        for clip, name, value in puts:
+            if clip != selected:
+                i = ids.index(clip)
+                node.parm("selected_prompt").set(i)
+                node.parm("prompt").set(d["prompts"][i]["text"])
+                node.parm("duration").set((d["prompts"][i]["end_frame"] - d["prompts"][i]["start_frame"]) / doc.FPS)
+                selected = clip
+            node.parm(name).set(value)
+    _clip_seen[sid] = _clip_look(node)
+
+
 _on_pose = {}
 
 
@@ -753,10 +839,12 @@ def _result(node):
     return _results[text]
 
 
-def store_result(node, samples, key, applied, sent=None):
+def store_result(node, samples, key, applied, sent=None, poses=None):
     result = {"key": key, "applied": applied, "samples": [pack_sample(*s) for s in samples]}
     if sent is not None:
         result["sent"] = sent
+    if poses is not None:
+        result["poses"] = {str(f): p for f, p in sorted(poses.items())}
     with hou.undos.disabler():
         node.parm(RESULT).set(json.dumps(result) if samples else "")
     _rig_motions.pop(node.sessionId(), None)
@@ -846,6 +934,16 @@ def changed_keyframes(node):
     return _changed[key]
 
 
+def can_reset(node):
+    result = _result(node)
+    return bool(result["samples"]) and "poses" in result
+
+
+def generated_pose(node, frame):
+    """a constraint frame's pose from the last generate"""
+    return _result(node)["poses"].get(str(frame)) or raw_pose(base_pose(node, frame))
+
+
 def changed_frames(node):
     return {frame for _, frame in changed_keyframes(node)}
 
@@ -902,12 +1000,14 @@ def import_folder(node, folder, what=None):
         write_raw_poses(node, raw, record=True)
         with rig.own_write(node):
             node.parm(rig.STASH).set(hou.Geometry())
-        node.parm("selected_prompt").set(0)
-        node.parm("prompt").set(clips[0][0])
-        node.parm("duration").set(clips[0][1] / doc.FPS)
+        with clip_write(node):
+            node.parm("selected_prompt").set(0)
+            node.parm("prompt").set(clips[0][0])
+            node.parm("duration").set(clips[0][1] / doc.FPS)
         for parm, value in settings.items():
             node.parm(parm).set(int(value) if isinstance(value, bool) else value)
     _own_step()
+    clip_step_here(node)
     update_unapplied(node)
     from . import timeline_edit
 
@@ -1005,6 +1105,8 @@ class _GenerateJob:
         self.request = client.make_request(self.doc, cjson)
         self.applied = constraints_key(cjson)
         self.sent = constraints_json(node, self.doc, keyframes=True) if node.evalParm("smooth_root_path") else cjson
+        frames = constraint_frames(self.doc)
+        self.poses = {f: p for f, p in _raw_poses(node).items() if f in frames}
         self.key = client.cache_key(self.request)
         self.folder = None
         self.job_id, self.started, self.canceled, self.proc = None, time.monotonic(), False, None
@@ -1035,7 +1137,7 @@ class _GenerateJob:
                 _was_auto.setdefault(self.node.sessionId(), set()).add((c["id"], tuple(c["frames"])))
         with hou.undos.disabler():
             write_doc(self.node, d)
-        store_result(self.node, samples, self.key, self.applied, self.sent)
+        store_result(self.node, samples, self.key, self.applied, self.sent, self.poses)
         update_unapplied(self.node)
         self.status(text, "done")
 
@@ -1482,6 +1584,7 @@ def follow_undo(node, viewer):
 def poll(node):
     """one look at a watched node"""
     sid = node.sessionId()
+    follow_clip_parms(node)
     seen = _watched[sid]
     if pose_state() == STOCK_STATE:
         for viewer in scene_viewers():

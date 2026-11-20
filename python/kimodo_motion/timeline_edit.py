@@ -24,6 +24,7 @@ def _dropped_text(dropped):
 
 
 def _settle(node):
+    motion_node.follow_clip_parms(node)
     motion_node._flush(node)
     motion_node.sync_poses(node)
 
@@ -39,13 +40,15 @@ def _write_prompts(node, d, label, selected=None):
     index = ids.index(selected)
     with hou.undos.group(motion_node.OWN_UNDO + label):
         motion_node.write_doc(node, d)
-        node.parm("selected_prompt").set(index)
-        node.parm("prompt").set(prompts[index]["text"])
-        node.parm("duration").set((prompts[index]["end_frame"] - prompts[index]["start_frame"]) / doc.FPS)
+        with motion_node.clip_write(node):
+            node.parm("selected_prompt").set(index)
+            node.parm("prompt").set(prompts[index]["text"])
+            node.parm("duration").set((prompts[index]["end_frame"] - prompts[index]["start_frame"]) / doc.FPS)
         raw = motion_node._raw_poses(node)
         if any(f >= total for f in raw):
             motion_node.write_raw_poses(node, {f: p for f, p in raw.items() if f < total}, record=True)
     motion_node._own_step()
+    motion_node.clip_step_here(node)
     motion_node.update_unapplied(node)
 
 
@@ -63,12 +66,11 @@ def select_prompt(node, pid):
     if d["prompts"][motion_node.selected_prompt(node, d)]["id"] == pid:
         return
     index = [p["id"] for p in d["prompts"]].index(pid)
-    with hou.undos.group(motion_node.OWN_UNDO + f"select prompt {index + 1}"):
+    with hou.undos.disabler(), motion_node.clip_write(node):
         motion_node.write_doc(node, d)
         node.parm("selected_prompt").set(index)
         node.parm("prompt").set(d["prompts"][index]["text"])
         node.parm("duration").set((d["prompts"][index]["end_frame"] - d["prompts"][index]["start_frame"]) / doc.FPS)
-    motion_node._own_step()
 
 
 def set_prompt_text(node, pid, text):
@@ -172,6 +174,43 @@ def move_runs(node, runs, delta):
         text += f" {'Its' if len(runs) == 1 else 'Moved'} poses replaced the ones already on {len(replaced)} frames ({replaced[0] + 1} to {replaced[-1] + 1})."
     motion_node.set_status(node, text)
     return moved
+
+
+def reset_runs(node, runs):
+    """markers back to their poses from the last generate"""
+    _settle(node)
+    if not motion_node.can_reset(node):
+        motion_node.set_status(node, "Nothing to reset to: press Generate first.")
+        return False
+    d = current_doc(node)
+    frames = sorted({f for _, run in runs for f in run})
+    raw = dict(motion_node._raw_poses(node))
+    for f in frames:
+        raw[f] = motion_node.generated_pose(node, f)
+    if len(runs) == 1:
+        c = next(c for c in d["constraints"] if c["id"] == runs[0][0])
+        what = f"{motion_node.TYPE_LABELS[c['type']]} constraint on {_span_text(frames)}"
+    else:
+        what = f"{len(runs)} markers"
+    motion_node._write_constraints(node, d, raw, motion_node.OWN_UNDO + f"reset {what}", frames)
+    motion_node._stand_for(node, frames)
+    motion_node.update_unapplied(node)
+    motion_node.set_status(node, f"Reset {what} to the last Generate.")
+    return True
+
+
+def clear_all(node):
+    _settle(node)
+    before = current_doc(node)
+    count = len(before["constraints"])
+    if not count:
+        motion_node.set_status(node, "There are no constraints to clear.")
+        return False
+    after = copy.deepcopy(before)
+    after["constraints"] = []
+    _write_constraints(node, before, after, {}, "clear all constraints")
+    motion_node.set_status(node, f"All constraints cleared ({count}).")
+    return True
 
 
 def add_range(node, ctype, first, last):

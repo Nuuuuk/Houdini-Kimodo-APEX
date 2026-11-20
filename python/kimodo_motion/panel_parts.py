@@ -260,6 +260,14 @@ class StatusWidget(QtWidgets.QFrame):
             self.log_link.setText(f'<a href="{url}">Open service.log</a>' if st["log"] else "")
 
 
+GENERATE_WIDTH = 290
+GENERATE_TALLER = 1.3
+
+
+def ui_scale():
+    return hou.ui.globalScaleFactor() if hou.isUIAvailable() else 1.0
+
+
 class KimodoPanel(QtWidgets.QWidget):
     def __init__(self, parm_editor_factory=None, canvas=None):
         super().__init__()
@@ -283,6 +291,13 @@ class KimodoPanel(QtWidgets.QWidget):
         )
         self.status = StatusWidget()
         self.status.dismissed.connect(self.dismiss_error)
+        self.buttons = QtWidgets.QWidget()
+        self.button_rows = QtWidgets.QVBoxLayout(self.buttons)
+        self.button_rows.setSpacing(4)
+        self.generate_button = QtWidgets.QPushButton("Generate")
+        self.generate_button.clicked.connect(self.press_generate)
+        self.button_rows.addWidget(self.generate_button, 0, QtCore.Qt.AlignLeft)
+        self.buttons.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed)
         fixed = QtWidgets.QSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed)
         self.timeline.setSizePolicy(fixed)
         self.status.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Maximum)
@@ -291,7 +306,9 @@ class KimodoPanel(QtWidgets.QWidget):
         self.stack.setSpacing(4)
         self.stack.addWidget(self.timeline, 0)
         self.stack.addWidget(self.status, 0)
+        self.stack.addWidget(self.buttons, 0)
         self.stack.addStretch(1)
+        self.place_buttons()
         self.timer = QtCore.QTimer(self)
         self.timer.setInterval(200)
         self.timer.timeout.connect(self.tick)
@@ -312,7 +329,7 @@ class KimodoPanel(QtWidgets.QWidget):
         if node is not None:
             if self.parm_editor is None:
                 self.parm_editor = self.parm_editor_factory(node)
-                self.stack.takeAt(2)
+                self.stack.takeAt(self.stack.count() - 1)
                 self.stack.addWidget(self.parm_editor, 1)
             else:
                 self.parm_editor.setNode(node)
@@ -328,6 +345,8 @@ class KimodoPanel(QtWidgets.QWidget):
             if self.node is None:
                 return
             self.status.show_status(motion_node.get_status(self.node))
+            self.generate_button.setText("Cancel" if self.node.evalParm("busy") else "Generate")
+            self.place_buttons()
             self.status.show_hint(self.hover_hint or motion_node.pose_hint(self.node))
             text = self.node.parm("kimodo_doc").unexpandedString()
             if text != self.doc_text:
@@ -343,6 +362,23 @@ class KimodoPanel(QtWidgets.QWidget):
             self.node = None
         finally:
             self.refreshing = False
+
+    def place_buttons(self):
+        scale = ui_scale()
+        left = self.timeline.labels.width()
+        if self.button_rows.contentsMargins().left() != left:
+            self.button_rows.setContentsMargins(left, 0, 0, 0)
+        size = QtCore.QSize(
+            round(GENERATE_WIDTH * scale), round(QtWidgets.QPushButton().sizeHint().height() * GENERATE_TALLER)
+        )
+        if self.generate_button.size() != size:
+            self.generate_button.setFixedSize(size)
+
+    def press_generate(self):
+        """generate, or cancel while a generation runs"""
+        if self.node is not None:
+            self.with_node(motion_node.cancel if self.node.evalParm("busy") else motion_node.generate)
+            self.refresh()
 
     def with_node(self, fn, *args):
         if self.node is not None:
