@@ -14,7 +14,7 @@ import time
 import hou
 import numpy as np
 
-from . import client, constraints, doc, rig, rootpath, skeleton
+from . import client, constraints, doc, examples, rig, rootpath, skeleton
 
 _running = {}
 _status = {}
@@ -261,7 +261,7 @@ def base_pose(node, frame):
     return constraints.Pose(np.tile(np.eye(3), (skeleton.NUM_JOINTS, 1, 1)), skeleton.rest_positions()[0])
 
 
-def constraints_json(node, d):
+def constraints_json(node, d, keyframes=False):
     stored = read_poses(node)
 
     def pose(frame):
@@ -276,7 +276,7 @@ def constraints_json(node, d):
         )
 
     cjson = constraints.to_kimodo_json(d["constraints"], pose)
-    return rootpath.apply(cjson) if node.evalParm("smooth_root_path") else cjson
+    return rootpath.apply(cjson) if node.evalParm("smooth_root_path") and not keyframes else cjson
 
 
 def constraints_key(cjson):
@@ -721,55 +721,146 @@ def finish_with(node, samples, text="Done."):
     return gen
 
 
-def import_constraints(node, path):
-    with open(path) as f:
-        cons, poses = constraints.from_kimodo_json(json.load(f))
-    d = doc_from_parms(node)
+def _plural(n, word):
+    return f"{n} {word}{'' if n == 1 else 's'}"
+
+
+SETTINGS = (
+    "model",
+    "seed",
+    "steps",
+    "cfg_text",
+    "cfg_constraint",
+    "num_samples",
+    "postprocess",
+    "root_margin",
+    "smooth_root_path",
+)
+
+
+def import_folder(node, folder, what=None):
+    name = os.path.basename(os.path.normpath(folder))
+    what = what or f"import timeline {name}"
+    try:
+        with open(os.path.join(folder, "meta.json"), encoding="utf-8") as f:
+            clips, settings, notes = examples.read_meta(json.load(f))
+        path = os.path.join(folder, "constraints.json")
+        data = []
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        cons, poses = constraints.from_kimodo_json(data)
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        raise hou.Error(f"{name}: {e}") from None
+    total = sum(frames for _, frames in clips)
     last = max((c["frames"][-1] for c in cons), default=0)
-    if last >= doc.total_frames(d):
-        raise hou.Error(
-            f"{os.path.basename(path)} has constraints up to frame {last + 1}, the motion has "
-            f"{doc.total_frames(d)} frames. Increase the duration first."
-        )
+    if last >= total or min((c["frames"][0] for c in cons), default=0) < 0:
+        raise hou.Error(f"{name}: constraints up to frame {last + 1}, its clips last {total} frames.")
+    d, start = read_doc(node), 0
+    d["prompts"] = []
+    for n, (text, frames) in enumerate(clips, 1):
+        d["prompts"].append({"id": f"p{n}", "text": text, "start_frame": start, "end_frame": start + frames})
+        start += frames
+    d["constraints"] = cons
     raw = {}
     for c in cons:
         for frame, pose in poses[c["id"]].items():
             if pose.local_rots is not None or frame not in raw:
                 raw[frame] = raw_pose(pose)
-    d["constraints"] = cons
     _flush(node)
-    with hou.undos.group(f"{OWN_UNDO}import constraints"):
+    with hou.undos.group(OWN_UNDO + what):
         write_doc(node, d)
         write_raw_poses(node, raw, record=True)
         node.parm(rig.STASH).set(hou.Geometry())
+        node.parm("selected_prompt").set(0)
+        node.parm("prompt").set(clips[0][0])
+        node.parm("duration").set(clips[0][1] / doc.FPS)
+        for parm, value in settings.items():
+            node.parm(parm).set(int(value) if isinstance(value, bool) else value)
+    _own_step()
     update_unapplied(node)
-    set_status(node, f"Imported {len(cons)} constraints from {os.path.basename(path)}.")
+    from . import timeline_edit
+
+    timeline_edit.update_root_path_guide(node)
+    text = f"{what[0].upper()}{what[1:]}: {_plural(len(clips), 'clip')}, {_plural(sum(len(c['frames']) for c in cons), 'keyframe')}."
+    set_status(node, " ".join([text, "Press Generate."] + notes))
 
 
-def export_constraints(node, path):
+def export_folder(node, folder):
     _flush(node)
     sync_poses(node)
-    d = read_doc(node)
-    with open(path, "w") as f:
-        json.dump(constraints_json(node, d), f)
-    set_status(node, f"Exported {len(d['constraints'])} constraints to {os.path.basename(path)}.")
-
-
-def import_constraints_dialog(node):
-    path = hou.ui.selectFile(title="Import Kimodo constraints", pattern="*.json", chooser_mode=hou.fileChooserMode.Read)
-    if path:
-        import_constraints(node, hou.text.expandString(path))
-
-
-def export_constraints_dialog(node):
-    path = hou.ui.selectFile(
-        title="Export Kimodo constraints",
-        pattern="*.json",
-        default_value="constraints.json",
-        chooser_mode=hou.fileChooserMode.Write,
+    d = doc_from_parms(node)
+    settings = {name: node.evalParm(name) for name in SETTINGS}
+    for name in ("postprocess", "smooth_root_path"):
+        settings[name] = bool(settings[name])
+    meta = examples.make_meta([(p["text"], p["end_frame"] - p["start_frame"]) for p in d["prompts"]], settings)
+    os.makedirs(folder, exist_ok=True)
+    for file, data in (("meta.json", meta), ("constraints.json", constraints_json(node, d, keyframes=True))):
+        with open(os.path.join(folder, file), "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    set_status(
+        node,
+        f"Timeline exported: {_plural(len(d['prompts']), 'clip')} and "
+        f"{_plural(sum(len(c['frames']) for c in d['constraints']), 'keyframe')} to {folder}.",
     )
-    if path:
-        export_constraints(node, hou.text.expandString(path))
+
+
+def _choose_folder(title):
+    path = hou.ui.selectFile(title=title, file_type=hou.fileType.Directory, chooser_mode=hou.fileChooserMode.Read)
+    return os.path.normpath(hou.text.expandString(path)) if path else None
+
+
+def import_dialog(node):
+    folder = _choose_folder("Import a timeline: a folder with meta.json and constraints.json")
+    if folder:
+        import_folder(node, folder)
+
+
+def export_dialog(node):
+    folder = _choose_folder("Export the timeline to a folder (meta.json and constraints.json)")
+    if not folder:
+        return
+    there = [f for f in ("meta.json", "constraints.json") if os.path.exists(os.path.join(folder, f))]
+    if there and hou.ui.displayMessage(
+        f"{folder} already has {' and '.join(there)}. Replace?",
+        buttons=("Replace", "Cancel"),
+        default_choice=1,
+        close_choice=1,
+    ):
+        return
+    export_folder(node, folder)
+
+
+def example_folders():
+    return examples.soma_examples(hou.getenv("KIMODO_MOTION") or "")
+
+
+def example_menu():
+    """menu script of the example parm"""
+    names = list(example_folders())
+    if not names:
+        return ["", "(Kimodo's examples were not found)"]
+    return [x for n in names for x in (n, examples.label(n))]
+
+
+def load_example(node):
+    """load the example picked in the menu, same as import"""
+    name = node.evalParm("example")
+    folder = example_folders().get(name)
+    if folder is None:
+        raise hou.Error(f"Kimodo's example {name!r} was not found in the installed Kimodo.")
+    import_folder(node, folder, f"load example {examples.label(name)}")
+
+
+def timeline_buttons(node):
+    """callback of the timeline import / export strip"""
+    clicked = node.evalParm("timeline")
+    with hou.undos.disabler():
+        node.parm("timeline").set(0)
+    if clicked & 1:
+        import_dialog(node)
+    elif clicked & 2:
+        export_dialog(node)
 
 
 class _GenerateJob:
