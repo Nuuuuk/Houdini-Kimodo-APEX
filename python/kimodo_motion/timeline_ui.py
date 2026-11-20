@@ -15,12 +15,18 @@ HINTS = {
     "prompts": "Prompts: click empty space to add · double-click to edit · drag the right edge for length · "
     "right-click to delete",
     "constraints": "Constraints: click a track for a keyframe at that frame · Ctrl+drag for a range · "
-    "drag to move · right-click to delete or change type",
+    "drag to move · drag empty space to select, Shift+drag or Shift+click to add · "
+    "right-click to delete or change type",
     "ruler": "Ruler: click or drag to set the frame · wheel pans · Shift+wheel zooms · Space plays · "
     "Left/Right step a frame",
     "": "",
 }
 ZOOM_STEP, ZOOM_MIN, ZOOM_MAX = 1.25, 0.3, 8.0
+SELECTED_LIGHTER = 1.4
+
+
+def brighter(rgb):
+    return tuple(min(255, round(v * SELECTED_LIGHTER)) for v in rgb)
 
 
 class Canvas(panel_parts.TimelineCanvas):
@@ -30,7 +36,7 @@ class Canvas(panel_parts.TimelineCanvas):
     prompt_delete_requested = QtCore.Signal(str)
     prompt_select_requested = QtCore.Signal(str)
     add_at_requested = QtCore.Signal(str, int)
-    run_move_requested = QtCore.Signal(str, object, int)
+    runs_move_requested = QtCore.Signal(object, int)
     run_delete_requested = QtCore.Signal(str, object)
     range_requested = QtCore.Signal(str, int, int)
     heading_requested = QtCore.Signal(str, bool)
@@ -43,6 +49,8 @@ class Canvas(panel_parts.TimelineCanvas):
         self.preview = None
         self.editor, self.editing = None, None
         self.selected = None
+        self.marked = set()
+        self.cleared = False
         self.hint = ""
         self.zoom = 1.0
         self.smooth_path = False
@@ -64,6 +72,10 @@ class Canvas(panel_parts.TimelineCanvas):
     def set_state(self, prompts, frame, constraints=()):
         before = self.frame
         super().set_state(prompts, frame, constraints)
+        there = {(c["id"], f) for c in self.constraints for f in c["frames"]}
+        if not self.marked <= there:
+            self.marked &= there
+            self.update()
         self.setMinimumWidth(self.span() * self.m.px_per_frame)
         if self.frame != before:
             self.follow()
@@ -165,6 +177,35 @@ class Canvas(panel_parts.TimelineCanvas):
                     found = c, run
         return found or (None, None)
 
+    def is_marked(self, c, run):
+        return any((c["id"], f) in self.marked for f in run)
+
+    def is_changed(self, c, run):
+        """differs from what the shown result was made with"""
+        return any((c["type"], f) in self.changed for f in run)
+
+    def marked_runs(self):
+        return [(c, run) for c in self.constraints for run in timeline.runs(c["frames"]) if self.is_marked(c, run)]
+
+    def marker_rect(self, ctype, run):
+        scale, y, size = self.scale(), self.track_y(ctype), max(self.m.row_h // 2 - 2, 4)
+        if len(run) > 1:
+            return QtCore.QRectF(run[0] * scale, y - size / 2, len(run) * scale, size)
+        return QtCore.QRectF(self.frame_x(run[0]) - size, y - size, 2 * size, 2 * size)
+
+    def runs_in(self, rect):
+        return {
+            (c["id"], f)
+            for c in self.constraints
+            for run in timeline.runs(c["frames"])
+            if self.marker_rect(c["type"], run).intersects(rect)
+            for f in run
+        }
+
+    def moved_marks(self, runs, delta):
+        moving = {(cid, f) for cid, run in runs for f in run}
+        return {(cid, f + delta) if (cid, f) in moving else (cid, f) for cid, f in self.marked}
+
     def on_playhead(self, pos):
         """on the current frame's line with nothing else under it"""
         row = self.row_at(pos)
@@ -176,6 +217,12 @@ class Canvas(panel_parts.TimelineCanvas):
         pos = event.position().toPoint()
         self.setFocus()
         row = self.row_at(pos)
+        self.cleared = False
+        if event.button() == QtCore.Qt.LeftButton and not event.modifiers() & QtCore.Qt.ShiftModifier and self.marked:
+            c, run = self.run_at(pos)
+            if c is None or not self.is_marked(c, run):
+                self.marked, self.cleared = set(), True
+                self.update()
         if event.button() == QtCore.Qt.LeftButton and not event.modifiers() and self.on_playhead(pos):
             self.drag = {
                 "kind": "playhead",
@@ -235,13 +282,24 @@ class Canvas(panel_parts.TimelineCanvas):
                 actions[chosen]()
         elif event.button() == QtCore.Qt.LeftButton:
             frame = self.frame_at(pos.x())
+            shift = bool(event.modifiers() & QtCore.Qt.ShiftModifier)
             if event.modifiers() & QtCore.Qt.ControlModifier:
                 start = run[0] if run is not None and len(run) == 1 else frame
                 self.drag = {"kind": "range", "type": ctype, "first": start, "last": frame}
             elif c is not None:
-                self.drag = {"kind": "move", "c": c, "run": run, "x": pos.x(), "delta": 0, "moved": False, "ok": True}
+                self.drag = {
+                    "kind": "move",
+                    "c": c,
+                    "run": run,
+                    "x": pos.x(),
+                    "delta": 0,
+                    "moved": False,
+                    "ok": True,
+                    "shift": shift,
+                    "runs": [(c, run)],
+                }
             else:
-                self.drag = {"kind": "key", "type": ctype, "frame": frame}
+                self.drag = {"kind": "key", "type": ctype, "frame": frame, "start": pos, "shift": shift}
             self.update()
 
     def drag_track(self, drag, pos):
@@ -249,25 +307,42 @@ class Canvas(panel_parts.TimelineCanvas):
             drag["last"] = self.frame_at(pos.x())
             lo, hi = sorted((drag["first"], drag["last"]))
             self.set_hint(f"Range: frames {lo + 1} to {hi + 1}")
+        elif drag["kind"] == "box":
+            drag["end"] = pos
+            self.marked = drag["base"] | self.runs_in(QtCore.QRectF(QtCore.QRect(drag["start"], pos).normalized()))
+            self.set_hint(f"Select: {len(self.marked_runs())} marker{'' if len(self.marked_runs()) == 1 else 's'}")
         else:
-            drag["moved"] = drag["moved"] or abs(pos.x() - drag["x"]) > 3
+            if not drag["moved"] and abs(pos.x() - drag["x"]) > 3:
+                drag["moved"] = True
+                if self.is_marked(drag["c"], drag["run"]):
+                    drag["runs"] = self.marked_runs()
+                else:
+                    self.marked = set()
             if not drag["moved"]:
                 return
-            run = drag["run"]
-            delta = round((pos.x() - drag["x"]) / self.scale())
-            delta = min(max(delta, -run[0]), self.total - 1 - run[-1])
-            shown = {"prompts": self.prompts, "constraints": copy.deepcopy(self.constraints)}
-            drag["delta"] = delta
-            drag["ok"] = delta == 0 or bool(timeline.move_run(shown, drag["c"]["id"], run, delta))
-            self.set_hint(
-                f"Move to frame {run[0] + delta + 1}" + ("" if drag["ok"] else ": a constraint is in the way")
+            runs = [(c["id"], run) for c, run in drag["runs"]]
+            shown = {"prompts": self.prompts, "constraints": self.constraints}
+            delta, in_the_way = timeline.move_check(shown, runs, round((pos.x() - drag["x"]) / self.scale()))
+            drag["delta"], drag["ok"] = delta, delta == 0 or not in_the_way
+            where = (
+                f"Move to frame {drag['run'][0] + delta + 1}"
+                if len(runs) == 1
+                else f"Move {len(runs)} markers by {delta:+d} frames"
             )
+            self.set_hint(where + ("" if drag["ok"] else ": a constraint is in the way"))
         self.update()
 
     def mouseMoveEvent(self, event):
         pos = event.position().toPoint()
         drag = self.drag
-        if drag is not None and drag["kind"] in ("range", "move"):
+        if (
+            drag is not None
+            and drag["kind"] == "key"
+            and (pos - drag["start"]).manhattanLength() >= QtWidgets.QApplication.startDragDistance()
+        ):
+            drag.update(kind="box", base=set(self.marked) if drag["shift"] else set())
+            self.drag_track(drag, pos)
+        elif drag is not None and drag["kind"] in ("range", "move", "box"):
             self.drag_track(drag, pos)
         elif drag is not None and drag["kind"] == "scrub":
             self.frame_requested.emit(self.frame_at(pos.x()))
@@ -298,18 +373,27 @@ class Canvas(panel_parts.TimelineCanvas):
             if drag["frames"] != before:
                 self.prompt_resize_requested.emit(drag["id"], drag["frames"])
         elif drag["kind"] == "playhead" and not drag["moved"] and drag["type"] is not None:
-            self.add_at_requested.emit(drag["type"], drag["frame"])
+            if not self.cleared:
+                self.add_at_requested.emit(drag["type"], drag["frame"])
         elif drag["kind"] == "add" and self.row_at(pos) == 0 and self.prompt_at(pos)[0] is None:
             self.prompt_add_requested.emit()
+        elif drag["kind"] == "box":
+            pass
         elif drag["kind"] == "key" or (drag["kind"] == "range" and drag["first"] == drag["last"]):
-            self.add_at_requested.emit(drag["type"], drag["frame"] if drag["kind"] == "key" else drag["first"])
+            if not self.cleared:
+                self.add_at_requested.emit(drag["type"], drag["frame"] if drag["kind"] == "key" else drag["first"])
         elif drag["kind"] == "range":
             self.range_requested.emit(drag["type"], drag["first"], drag["last"])
+        elif drag["kind"] == "move" and not drag["moved"] and drag["shift"]:
+            on = not self.is_marked(drag["c"], drag["run"])
+            pairs = {(drag["c"]["id"], f) for f in drag["run"]}
+            self.marked = self.marked | pairs if on else self.marked - pairs
         elif drag["kind"] == "move" and not drag["moved"]:
+            self.marked = set()
             x = pos.x() / self.scale() - 0.5
             self.frame_requested.emit(min(drag["run"], key=lambda f: abs(f - x)))
-        elif drag["kind"] == "move" and drag["ok"] and drag["delta"]:
-            self.run_move_requested.emit(drag["c"]["id"], drag["run"], drag["delta"])
+        elif drag["kind"] == "move" and drag["delta"]:
+            self.runs_move_requested.emit([(c["id"], run) for c, run in drag["runs"]], drag["delta"])
         self.update()
         self.mouseMoveEvent(event)
 
@@ -404,16 +488,28 @@ class Canvas(panel_parts.TimelineCanvas):
         if self.smooth_path and len(waypoints) > 1:
             self.paint_constraint(p, {"type": "root2d"}, list(range(waypoints[0], waypoints[-1] + 1)), 70)
         drag = self.drag or {"kind": ""}
-        moving = drag["kind"] == "move" and drag["moved"]
+        moving = ({(c["id"], f) for c, run in drag["runs"] for f in run} if drag["kind"] == "move" and drag["moved"] else set())
         for c in self.constraints:
-            if moving and c["id"] == drag["c"]["id"]:
-                self.paint_constraint(p, c, [f for f in c["frames"] if f not in drag["run"]])
-                self.paint_constraint(p, c, [f + drag["delta"] for f in drag["run"]], 255 if drag["ok"] else 90)
-            else:
-                self.paint_constraint(p, c)
+            staying = [f for f in c["frames"] if (c["id"], f) not in moving]
+            for run in timeline.runs(staying):
+                self.paint_constraint(p, c, run, marked=self.is_marked(c, run), changed=self.is_changed(c, run))
+            landing = [f + drag["delta"] for f in c["frames"] if (c["id"], f) in moving]
+            for run in timeline.runs(landing):
+                self.paint_constraint(
+                    p,
+                    c,
+                    run,
+                    255 if drag["ok"] else 90,
+                    marked=self.is_marked(c, [f - drag["delta"] for f in run]),
+                    changed=bool(drag["delta"]) or self.is_changed(c, [f - drag["delta"] for f in run]),
+                )
         if drag["kind"] == "range":
             lo, hi = sorted((drag["first"], drag["last"]))
             self.paint_constraint(p, {"type": drag["type"]}, list(range(lo, hi + 1)), 150)
+        if drag["kind"] == "box":
+            p.setPen(QtGui.QPen(QtGui.QColor(255, 255, 255, 170), 1))
+            p.setBrush(QtGui.QColor(255, 255, 255, 30))
+            p.drawRect(QtCore.QRectF(QtCore.QRect(drag["start"], drag["end"]).normalized()))
         p.setRenderHint(QtGui.QPainter.Antialiasing, False)
         p.end()
 
@@ -450,10 +546,11 @@ class Canvas(panel_parts.TimelineCanvas):
     def track_y(self, ctype):
         return self.m.ruler_h + (panel_parts.TRACK_TYPES.index(ctype) + 1) * self.m.row_h + self.m.row_h // 2
 
-    def paint_constraint(self, p, c, frames=None, alpha=255):
+    def paint_constraint(self, p, c, frames=None, alpha=255, marked=False, changed=False):
         scale, y = self.scale(), self.track_y(c["type"])
         size = max(self.m.row_h // 2 - 2, 4)
-        color = QtGui.QColor(*(motion_node.AUTO_MARKER_RGB if c.get("auto") else motion_node.MARKER_RGB), alpha)
+        rgb = motion_node.UNAPPLIED_MARKER_RGB if changed else motion_node.MARKER_RGB
+        color = QtGui.QColor(*(brighter(rgb) if marked else rgb), alpha)
         p.setPen(QtCore.Qt.NoPen)
         p.setBrush(color)
         for run in timeline.runs(c["frames"] if frames is None else frames):
@@ -489,7 +586,7 @@ class Panel(panel_parts.KimodoPanel):
         canvas.prompt_delete_requested.connect(lambda pid: self.edit(timeline_edit.delete_prompt, pid))
         canvas.prompt_select_requested.connect(lambda pid: self.edit(timeline_edit.select_prompt, pid))
         canvas.add_at_requested.connect(lambda ctype, frame: self.with_node(motion_node.add_constraint, ctype, frame))
-        canvas.run_move_requested.connect(lambda cid, run, delta: self.edit(timeline_edit.move_run, cid, run, delta))
+        canvas.runs_move_requested.connect(self.move_runs)
         canvas.run_delete_requested.connect(lambda cid, run: self.edit(timeline_edit.delete_run, cid, run))
         canvas.range_requested.connect(lambda ctype, a, b: self.edit(timeline_edit.add_range, ctype, a, b))
         canvas.heading_requested.connect(lambda cid, on: self.edit(timeline_edit.set_heading, cid, on))
@@ -563,6 +660,14 @@ class Panel(panel_parts.KimodoPanel):
             motion_node.set_status(self.node, f"Not done: {e}.")
         self.refresh()
         return result
+
+    def move_runs(self, runs, delta):
+        canvas = self.timeline.canvas
+        before = canvas.marked
+        canvas.marked = canvas.moved_marks(runs, delta)
+        if not self.edit(timeline_edit.move_runs, runs, delta):
+            canvas.marked = before
+            canvas.update()
 
     def add_prompt(self):
         pid = self.edit(timeline_edit.add_prompt)

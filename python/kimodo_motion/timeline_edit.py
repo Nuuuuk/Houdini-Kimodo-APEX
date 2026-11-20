@@ -124,36 +124,54 @@ def _span_text(frames):
     return f"frame {frames[0] + 1}" if len(frames) == 1 else f"frames {frames[0] + 1} to {frames[-1] + 1}"
 
 
-def move_run(node, cid, run, delta):
+def _frames_text(frames):
+    return f"frame {frames[0] + 1}" if len(frames) == 1 else f"frames {', '.join(str(f + 1) for f in frames)}"
+
+
+def move_runs(node, runs, delta):
     _settle(node)
     before = current_doc(node)
     after = copy.deepcopy(before)
-    mapping = timeline.move_run(after, cid, list(run), delta)
-    if not mapping:
-        motion_node.set_status(
-            node, "Not moved: a constraint of the same type is in the way, or it is at the end of the motion."
+    runs = [(cid, list(run)) for cid, run in runs]
+    moved = timeline.move_runs(after, runs, delta)
+    if not moved:
+        delta, in_the_way = timeline.move_check(before, runs, delta)
+        if in_the_way:
+            ctype = in_the_way[0][0]
+            frames = [f for t, f in in_the_way if t == ctype]
+            motion_node.set_status(
+                node,
+                f"Not moved: {_frames_text(frames)} already {'has' if len(frames) == 1 else 'have'} a "
+                f"{motion_node.TYPE_LABELS[ctype]} constraint.",
+            )
+        else:
+            motion_node.set_status(node, "Not moved: " + ("it is" if len(runs) == 1 else "they are") + " at the end of the motion.")
+        return {}
+    mapping = {}
+    for cid, frames in moved.items():
+        mapping.update(frames)
+        next(c for c in after["constraints"] if c["id"] == cid).pop("auto", None)
+    staying = {f for c in before["constraints"] for f in c["frames"] if f not in moved.get(c["id"], {})}
+    replaced = sorted(set(mapping.values()) & staying)
+    if len(runs) == 1:
+        c = next(c for c in after["constraints"] if c["id"] == runs[0][0])
+        where = _span_text(sorted(mapping.values()))
+        label, text = (
+            f"move {motion_node.TYPE_LABELS[c['type']]} constraint to {where}",
+            f"{motion_node.TYPE_LABELS[c['type']]} constraint moved to {where}.",
         )
-        return False
-    c = next(c for c in after["constraints"] if c["id"] == cid)
-    c.pop("auto", None)
-    had = motion_node.types_at(before)
-    replaced = sorted(new for new in mapping.values() if new in had and new not in mapping)
-    _write_constraints(
-        node,
-        before,
-        after,
-        mapping,
-        f"move {motion_node.TYPE_LABELS[c['type']]} constraint to {_span_text(sorted(mapping.values()))}",
-    )
-    text = f"{motion_node.TYPE_LABELS[c['type']]} constraint moved to {_span_text(sorted(mapping.values()))}."
+    else:
+        label = f"move {len(runs)} markers by {delta:+d} frames"
+        text = f"{len(runs)} markers moved by {delta:+d} frames."
+    _write_constraints(node, before, after, mapping, label)
     if len(replaced) == 1:
-        text += f" Its pose replaced the one already on frame {replaced[0] + 1}."
-    elif replaced:
         text += (
-            f" Its poses replaced the ones already on {len(replaced)} frames ({replaced[0] + 1} to {replaced[-1] + 1})."
+            f" {'Its pose' if len(runs) == 1 else 'A moved pose'} replaced the one already on frame {replaced[0] + 1}."
         )
+    elif replaced:
+        text += f" {'Its' if len(runs) == 1 else 'Moved'} poses replaced the ones already on {len(replaced)} frames ({replaced[0] + 1} to {replaced[-1] + 1})."
     motion_node.set_status(node, text)
-    return True
+    return moved
 
 
 def add_range(node, ctype, first, last):

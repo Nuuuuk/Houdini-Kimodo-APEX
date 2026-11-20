@@ -1,5 +1,6 @@
 """the apex constraint rig inside the asset: baking and reading poses."""
 
+import contextlib
 import uuid
 
 import hou
@@ -165,11 +166,33 @@ def _with_keys(top, keys):
     return _edited_copy(top, write)
 
 
+_writing = set()
+
+
+@contextlib.contextmanager
+def own_write(node):
+    """around a stash write from here, so only houdini's own changes get counted"""
+    _writing.add(node.sessionId())
+    try:
+        yield
+    finally:
+        _writing.discard(node.sessionId())
+
+
+def writing(node):
+    return node.sessionId() in _writing
+
+
 def _set_stash(node, top, tag):
     if top.findGlobalAttrib(TAG) is None:
         top.addAttrib(hou.attribType.Global, TAG, "")
     top.setGlobalAttribValue(TAG, tag)
-    node.parm(STASH).set(top)
+    with own_write(node):
+        node.parm(STASH).set(top)
+
+
+def relabel(node, tag):
+    _set_stash(node, hou.Geometry(stash(node)), tag)
 
 
 def stash_tag(node):

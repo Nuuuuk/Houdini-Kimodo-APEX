@@ -178,7 +178,60 @@ _raw_cache = {}
 _poses_cache = {}
 _types_cache = {}
 _pose_of = {}
+_was_auto = {}
+_made = {}
+_foreign = {}
+_tracked = set()
+
+
+def _track(node):
+    if node.sessionId() not in _tracked:
+        _tracked.add(node.sessionId())
+        node.addEventCallback((hou.nodeEventType.ParmTupleChanged,), _on_stash_changed)
+
+
+def _on_stash_changed(node, event_type, **kwargs):
+    parm_tuple = kwargs.get("parm_tuple")
+    if (parm_tuple is None or parm_tuple.name() == rig.STASH) and not rig.writing(node):
+        _foreign[node.sessionId()] = _foreign.get(node.sessionId(), 0) + 1
+
+
 _on_pose = {}
+
+
+def _records(node, tag=None):
+    kept = _pose_of.setdefault(node.sessionId(), {})
+    tag = tag or rig.tag_for(node, shown_result(node))
+    if tag not in kept and len(kept) >= rig.MAX_BAKES:
+        kept.pop(next(iter(kept)))
+    return kept.setdefault(tag, {})
+
+
+def _undone_animation(node, table=None):
+    sid, top = node.sessionId(), rig.stash(node)
+    if top is None or rig.damaged(top) or not _foreign.get(sid):
+        return None
+    tag, shown, bases = rig.stash_tag(node), rig.tag_for(node, shown_result(node)), rig._bases.get(sid, {})
+    if tag == shown:
+        others = [t for t in bases if t != shown and t in _pose_of.get(sid, {})]
+        if not others or shown not in bases:
+            return None
+        names, mine = table if table is not None else rig.stash_table(node)
+
+        def on_bake(t):
+            _, base_names, base = bases[t]
+            return (
+                -1
+                if base_names != names or base.shape != mine.shape
+                else int((np.abs(mine - base).max(axis=0) <= rig.EPS).sum())
+            )
+
+        tag = max(others, key=on_bake)
+        if on_bake(tag) <= on_bake(shown):
+            return None
+    if tag not in _pose_of.get(sid, {}) or tag not in bases:
+        return None
+    return tag
 
 
 def _raw_poses(node):
@@ -312,12 +365,17 @@ def _stand_for(node, frames):
     if not frames or not rig.current(node, source):
         return
     _, mine = rig.stash_table(node)
-    raw, known = _raw_poses(node), _pose_of.setdefault(node.sessionId(), {})
-    on_pose = _on_pose.setdefault(node.sessionId(), {})
+    raw, known = _raw_poses(node), _records(node)
+    on_pose, made, types = (
+        _on_pose.setdefault(node.sessionId(), {}),
+        _made.setdefault(node.sessionId(), {}),
+        _types(node),
+    )
     for frame in frames:
         if frame in raw and frame < mine.shape[1]:
             known.setdefault(frame, {})[mine[:, frame].tobytes()] = raw[frame]
             on_pose[frame] = mine[:, frame].tobytes()
+            made[frame] = (on_pose[frame], _taken(types.get(frame, ())), raw[frame])
 
 
 @contextlib.contextmanager
@@ -338,12 +396,15 @@ def _interruptible(text, long):
 
 def ensure_rig(node):
     """give the rig its animation for what the node shows, if it doesn't have it"""
+    _track(node)
     source = shown_result(node)
     if node.evalParm("motion_frames") != motion_frames(node):
         with hou.undos.disabler():
             node.parm("motion_frames").set(motion_frames(node))
     if rig.current(node, source):
         return False
+    if _undone_animation(node) is not None:
+        sync_poses(node)
     frames = [f for f in constraint_frames(read_doc(node)) if f in _raw_poses(node)]
 
     def build():
@@ -359,8 +420,9 @@ def ensure_rig(node):
             "Converting motion to rig\u2026", rig.bake_seconds(node, doc.total_frames(doc_from_parms(node))) > 1.0
         ):
             build()
-    _pose_of.pop(node.sessionId(), None)
     _on_pose.pop(node.sessionId(), None)
+    _made.pop(node.sessionId(), None)
+    _foreign[node.sessionId()] = 0
     _stand_for(node, list(_raw_poses(node)))
     _shown.pop(node.sessionId(), None)
     before = _before_interruption.pop(node.sessionId(), None)
@@ -371,34 +433,66 @@ def ensure_rig(node):
 
 def sync_poses(node):
     """stored poses and auto constraints follow the rig keys"""
+    _track(node)
     source = shown_result(node)
-    if not rig.current(node, source):
-        return
+    if rig.current(node, source):
+        names, mine = rig.stash_table(node)
+        undone = _undone_animation(node, (names, mine))
+    else:
+        undone = _undone_animation(node)
+        if undone is None:
+            return
+        names, mine = rig.stash_table(node)
     d = read_doc(node)
-    names, mine = rig.stash_table(node)
     every = mine
-    _, base_names, base = rig.base(node, source)
+    if undone is None:
+        _, base_names, base = rig.base(node, source)
+        known, gone = _records(node), set()
+    else:
+        _, base_names, base = rig._bases[node.sessionId()][undone]
+        known, gone = _records(node, undone), _was_auto.get(node.sessionId(), set())
+        if base.shape[1] != mine.shape[1]:
+            return
     if names != base_names:
         rows = [names.index(n) for n in base_names if n in names]
         mine, base = mine[rows], base[[base_names.index(names[r]) for r in rows]]
     posed = np.abs(mine - base).max(axis=0) > rig.EPS
     types, raw = types_at(d), dict(_raw_poses(node))
-    known = _pose_of.setdefault(node.sessionId(), {})
+    if undone is None and not _foreign.get(node.sessionId()):
+        made = _made.get(node.sessionId(), {})
+        baked = [
+            f
+            for f in sorted(types)
+            if f in raw and f < mine.shape[1] and made.get(f) != (every[:, f].tobytes(), _taken(types[f]), raw[f])
+        ]
+        freed = [f for f in np.nonzero(posed)[0].tolist() if f not in types]
+        if baked or freed:
+            with hou.undos.disabler():
+                rig.put_frames(node, source, baked, freed)
+            _stand_for(node, baked)
+            _shown.pop(node.sessionId(), None)
+        return
     on_pose = _on_pose.setdefault(node.sessionId(), {})
     added, removed, renew = [], [], []
     for frame in sorted(set(np.nonzero(posed)[0].tolist()) | set(types)):
         if frame >= mine.shape[1]:
             continue
         on_frame = [c for c in d["constraints"] if frame in c["frames"]]
-        if on_frame and not posed[frame] and all(c.get("auto") for c in on_frame):
+        if (
+            on_frame
+            and not posed[frame]
+            and all(c.get("auto") or (c["id"], tuple(c["frames"])) in gone for c in on_frame)
+        ):
             d["constraints"] = [c for c in d["constraints"] if c not in on_frame]
             raw.pop(frame, None)
             removed.append(frame)
             continue
+        keys = mine[:, frame].tobytes()
+        if undone is not None and keys not in known.get(frame, {}):
+            continue
         if not on_frame:
             d["constraints"].append({"id": _new_id(d), "type": "fullbody", "frames": [frame], "auto": True})
             added.append(frame)
-        keys = mine[:, frame].tobytes()
         seen = known.setdefault(frame, {})
         if keys not in seen:
             if frame in raw and not seen and not posed[frame]:
@@ -409,13 +503,18 @@ def sync_poses(node):
         raw[frame] = seen[keys]
         ctypes = types.get(frame, set())
         if (
-            posed[frame]
+            undone is None
+            and posed[frame]
             and "fullbody" not in ctypes
             and ctypes & set(skeleton.TIPS)
             and every[:, frame].tobytes() != on_pose.get(frame)
         ):
             renew.append(frame)
     write_raw_poses(node, raw)
+    if undone is not None and rig.stash_tag(node) != undone:
+        with hou.undos.disabler():
+            rig.relabel(node, undone)
+    _foreign[node.sessionId()] = 0
     if renew:
         with hou.undos.disabler():
             rig.put_frames(node, source, renew)
@@ -472,8 +571,7 @@ def _write_constraints(node, d, raw, label, renew=()):
 
 def update_unapplied(node):
     """unapplied: do the constraints differ from the ones the result was made with"""
-    d = read_doc(node)
-    unapplied = int(constraints_key(constraints_json(node, d)) != d["result"].get("applied", NO_CONSTRAINTS))
+    unapplied = int(constraints_key(constraints_json(node, read_doc(node))) != applied_key(node))
     if node.evalParm("unapplied") != unapplied:
         with hou.undos.disabler():
             node.parm("unapplied").set(unapplied)
@@ -655,11 +753,12 @@ def _result(node):
     return _results[text]
 
 
-def store_result(node, samples, key):
+def store_result(node, samples, key, applied, sent=None):
+    result = {"key": key, "applied": applied, "samples": [pack_sample(*s) for s in samples]}
+    if sent is not None:
+        result["sent"] = sent
     with hou.undos.disabler():
-        node.parm(RESULT).set(
-            json.dumps({"key": key, "samples": [pack_sample(*s) for s in samples]}) if samples else ""
-        )
+        node.parm(RESULT).set(json.dumps(result) if samples else "")
     _rig_motions.pop(node.sessionId(), None)
     set_result_samples(node)
 
@@ -721,6 +820,36 @@ def finish_with(node, samples, text="Done."):
     return gen
 
 
+def applied_key(node):
+    """key of the constraints the shown result was made with"""
+    result = _result(node)
+    return result.get("applied", NO_CONSTRAINTS) if result["samples"] else NO_CONSTRAINTS
+
+
+_changed = {}
+
+
+def changed_keyframes(node):
+    """{(type, frame)} whose constraint or pose differs from the shown result"""
+    result = _result(node)
+    key = (node.parm("kimodo_doc").unexpandedString(), node.parm("kimodo_poses").unexpandedString(), shown_result(node))
+    if key not in _changed:
+        _changed.clear()
+        now = constraints.frame_entries(constraints_json(node, read_doc(node), keyframes=True))
+        if not result["samples"]:
+            _changed[key] = set(now)
+        elif "sent" not in result:
+            _changed[key] = set()
+        else:
+            sent = constraints.frame_entries(result["sent"])
+            _changed[key] = {k for k, v in now.items() if sent.get(k) != v}
+    return _changed[key]
+
+
+def changed_frames(node):
+    return {frame for _, frame in changed_keyframes(node)}
+
+
 def _plural(n, word):
     return f"{n} {word}{'' if n == 1 else 's'}"
 
@@ -771,7 +900,8 @@ def import_folder(node, folder, what=None):
     with hou.undos.group(OWN_UNDO + what):
         write_doc(node, d)
         write_raw_poses(node, raw, record=True)
-        node.parm(rig.STASH).set(hou.Geometry())
+        with rig.own_write(node):
+            node.parm(rig.STASH).set(hou.Geometry())
         node.parm("selected_prompt").set(0)
         node.parm("prompt").set(clips[0][0])
         node.parm("duration").set(clips[0][1] / doc.FPS)
@@ -874,6 +1004,7 @@ class _GenerateJob:
         cjson = constraints_json(node, self.doc)
         self.request = client.make_request(self.doc, cjson)
         self.applied = constraints_key(cjson)
+        self.sent = constraints_json(node, self.doc, keyframes=True) if node.evalParm("smooth_root_path") else cjson
         self.key = client.cache_key(self.request)
         self.folder = None
         self.job_id, self.started, self.canceled, self.proc = None, time.monotonic(), False, None
@@ -897,14 +1028,14 @@ class _GenerateJob:
     def finish(self, text, samples):
         d = read_doc(self.node)
         d.update({k: self.doc[k] for k in ("model", "prompts", "generation")})
-        d["result"] = {"npz": [], "selected": 0, "applied": self.applied}
+        d["result"] = {"npz": [], "selected": 0}
         sent = {c["id"] for c in self.doc["constraints"]}
         for c in d["constraints"]:
-            if c["id"] in sent:
-                c.pop("auto", None)
+            if c["id"] in sent and c.pop("auto", None):
+                _was_auto.setdefault(self.node.sessionId(), set()).add((c["id"], tuple(c["frames"])))
         with hou.undos.disabler():
             write_doc(self.node, d)
-        store_result(self.node, samples, self.key)
+        store_result(self.node, samples, self.key, self.applied, self.sent)
         update_unapplied(self.node)
         self.status(text, "done")
 
@@ -1171,6 +1302,7 @@ def node_ready(node):
         with hou.undos.disabler():
             node.parm("is_posing").set(0)
     set_result_samples(node)
+    _track(node)
     watch(node)
 
 
@@ -1304,28 +1436,31 @@ def show_pinned_controls(node, viewer):
     current = {path for t in templates for path in ac.getEnabledControlsFromTemplate(t, invert=True)}
     if shown.get(viewer.name()) == frozenset(visible) and current == disabled:
         return
-    if shown.get(viewer.name()) != frozenset(visible):
-        viewer.runStateCommand(
-            "showControls",
-            {
-                "controls": [rig.CONTROLS_PATH + name for name in sorted(visible)],
-                "controls_in_tree_format": False,
-                "pick_modifier": hou.pickModifier.Replace,
-            },
+    with hou.undos.disabler():
+        if shown.get(viewer.name()) != frozenset(visible):
+            viewer.runStateCommand(
+                "showControls",
+                {
+                    "controls": [rig.CONTROLS_PATH + name for name in sorted(visible)],
+                    "controls_in_tree_format": False,
+                    "pick_modifier": hou.pickModifier.Replace,
+                },
+            )
+        if current != disabled:
+            for template in templates:
+                ac.setControlTemplateEnabled(template, sorted(current - disabled), True)
+                ac.setControlTemplateEnabled(template, sorted(disabled), False)
+            state.runSceneCallbacks(force=True)
+        selectable = pinned | (
+            rig.selected_by_selectors() if not pinned.isdisjoint(skeleton.FINGER_SELECTORS) else set()
         )
-    if current != disabled:
-        for template in templates:
-            ac.setControlTemplateEnabled(template, sorted(current - disabled), True)
-            ac.setControlTemplateEnabled(template, sorted(disabled), False)
-        state.runSceneCallbacks(force=True)
-    selectable = pinned | (rig.selected_by_selectors() if not pinned.isdisjoint(skeleton.FINGER_SELECTORS) else set())
-    selected = list(state.control_selection)
-    still = [path for path in selected if path.rsplit("/", 1)[-1] in selectable]
-    if len(still) != len(selected):
-        viewer.runStateCommand(
-            "selectControls",
-            {"controls": still, "controls_in_tree_format": False, "pick_modifier": hou.pickModifier.Replace},
-        )
+        selected = list(state.control_selection)
+        still = [path for path in selected if path.rsplit("/", 1)[-1] in selectable]
+        if len(still) != len(selected):
+            viewer.runStateCommand(
+                "selectControls",
+                {"controls": still, "controls_in_tree_format": False, "pick_modifier": hou.pickModifier.Replace},
+            )
     shown[viewer.name()] = frozenset(visible)
 
 
@@ -1337,7 +1472,8 @@ def follow_undo(node, viewer):
     import apex.ui.statecommandutils as scu
 
     sid, redo = node.sessionId(), len(hou.undos.redoLabels())
-    if sid in _redo_seen and _redo_seen[sid] != redo:
+    own = bool(_undo_event) and _undo_event[1].startswith(OWN_UNDO)
+    if sid in _redo_seen and _redo_seen[sid] != redo and not own:
         with hou.undos.disabler():
             scu.getAnimateState(viewer).writeToSopNode()
     _redo_seen[sid] = redo
@@ -1427,7 +1563,7 @@ def cook_notice(sop):
         raise hou.NodeWarning(f"The last Generate failed; this is {shown}.\n{error}")
 
 
-MARKER_RGB, AUTO_MARKER_RGB = (240, 170, 60), (240, 210, 130)
+MARKER_RGB, UNAPPLIED_MARKER_RGB = (240, 170, 60), (190, 140, 230)
 REST_COLOR = (0.33, 0.33, 0.33)
 MAX_POSES = 40
 RUN_STEP = 10
@@ -1448,13 +1584,17 @@ _PINNED_JOINTS = {ctype: _pinned_joints(ctype) for ctype in skeleton.TIPS}
 _BONES = [(p, j) for j, p in enumerate(skeleton.PARENTS) if p >= 0]
 
 
-def _pose_colors(d, types, frame):
+def _marker_color(frame, changed):
+    """color of a frame's pose, same as its timeline marker"""
+    return tuple(v / 255.0 for v in (UNAPPLIED_MARKER_RGB if frame in changed else MARKER_RGB))
+
+
+def _pose_colors(types, frame, changed):
     """per joint colors of a constraint frame's pose"""
     ctypes = types.get(frame, set())
     if not ctypes - {"root2d"}:
         return None
-    auto = all(c.get("auto") for c in d["constraints"] if frame in c["frames"])
-    marker = tuple(v / 255.0 for v in (AUTO_MARKER_RGB if auto else MARKER_RGB))
+    marker = _marker_color(frame, changed)
     pinned = (
         set(range(skeleton.NUM_JOINTS))
         if "fullbody" in ctypes
@@ -1465,7 +1605,7 @@ def _pose_colors(d, types, frame):
 
 def pose_colors(node, frame):
     """per joint colors of a constraint frame's pose"""
-    return _pose_colors(read_doc(node), _types(node), frame)
+    return _pose_colors(_types(node), frame, changed_frames(node))
 
 
 def posed_positions(node, frame, rig_pose):
@@ -1520,11 +1660,10 @@ def cook_poses(sop):
     if not node.evalParm("show_poses"):
         return
     d = read_doc(node)
-    types, stored, motion = types_at(d), read_poses(node), shown_motion(node)
-    auto = {f for f in types if all(c.get("auto") for c in d["constraints"] if f in c["frames"])}
+    types, stored, motion, changed = types_at(d), read_poses(node), shown_motion(node), changed_frames(node)
 
     def color(frame):
-        return tuple(v / 255.0 for v in (AUTO_MARKER_RGB if frame in auto else MARKER_RGB))
+        return _marker_color(frame, changed)
 
     points, colors, frames, lines = [], [], [], []
     for frame in pose_frames(d)[0]:
@@ -1533,7 +1672,7 @@ def cook_poses(sop):
         positions, _ = _composed(node, motion, frame)
         first = len(points)
         points += positions.tolist()
-        colors += _pose_colors(d, types, frame)
+        colors += _pose_colors(types, frame, changed)
         frames += [frame] * skeleton.NUM_JOINTS
         lines += [(first + a, first + b) for a, b in _BONES]
 
@@ -1583,11 +1722,10 @@ def pose_labels(node):
         found = []
         if key[3]:
             d = read_doc(node)
-            types, stored, motion = types_at(d), read_poses(node), shown_motion(node)
-            auto = {f for f in types if all(c.get("auto") for c in d["constraints"] if f in c["frames"])}
+            types, stored, motion, changed = types_at(d), read_poses(node), shown_motion(node), changed_frames(node)
 
             def color(frame):
-                return tuple(v / 255.0 for v in (AUTO_MARKER_RGB if frame in auto else MARKER_RGB))
+                return _marker_color(frame, changed)
 
             for frame, labeled in pose_frames(d)[0].items():
                 if labeled and stored.get(frame) is not None:

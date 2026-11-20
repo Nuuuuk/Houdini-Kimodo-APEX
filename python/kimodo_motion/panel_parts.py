@@ -101,6 +101,7 @@ class TimelineCanvas(FontSized):
 
     def __init__(self):
         self.prompts, self.constraints, self.total, self.frame = [], [], 5 * doc.FPS, 0
+        self.changed = set()
         super().__init__()
 
     def scale(self):
@@ -332,9 +333,12 @@ class KimodoPanel(QtWidgets.QWidget):
             if text != self.doc_text:
                 self.doc_text, self.doc = text, motion_node.read_doc(self.node)
             d = self.doc
-            self.timeline.canvas.set_state(
-                motion_node.shown_prompts(self.node, d), int(round(hou.frame())) - 1, d["constraints"]
-            )
+            canvas = self.timeline.canvas
+            changed = motion_node.changed_keyframes(self.node)
+            if changed != canvas.changed:
+                canvas.changed = changed
+                canvas.update()
+            canvas.set_state(motion_node.shown_prompts(self.node, d), int(round(hou.frame())) - 1, d["constraints"])
         except (hou.ObjectWasDeleted, doc.DocError):
             self.node = None
         finally:

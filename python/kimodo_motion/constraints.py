@@ -99,6 +99,15 @@ def to_kimodo_json(constraints, pose_source):
     return out
 
 
+def frame_entries(cjson):
+    """{(type, frame): what the json sends for it}"""
+    out = {}
+    for entry in cjson:
+        for i, frame in enumerate(entry["frame_indices"]):
+            out[(entry["type"], frame)] = {k: v[i] for k, v in entry.items() if k not in ("type", "frame_indices")}
+    return out
+
+
 def from_kimodo_json(data):
     """(constraints, poses) from kimodo's json list"""
     constraints, poses = [], {}

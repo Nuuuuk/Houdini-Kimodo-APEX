@@ -84,16 +84,29 @@ def _taken(d, ctype, skip=()):
     return {f for c in d["constraints"] if c["type"] == ctype for f in c["frames"] if (c["id"], f) not in skip}
 
 
-def move_run(d, cid, run, delta):
-    c = _find(d, "constraints", cid)
-    delta = min(max(delta, -run[0]), doc.total_frames(d) - 1 - run[-1])
-    if delta == 0:
+def move_check(d, runs_, delta):
+    """where a move would go: (delta, replaced)"""
+    lo, hi = min(r[0] for _, r in runs_), max(r[-1] for _, r in runs_)
+    delta = min(max(delta, -lo), doc.total_frames(d) - 1 - hi)
+    moving = {(cid, f) for cid, run in runs_ for f in run}
+    in_the_way = set()
+    for cid, run in runs_:
+        ctype = _find(d, "constraints", cid)["type"]
+        in_the_way |= {(ctype, f) for f in _taken(d, ctype, skip=moving) & {f + delta for f in run}}
+    return delta, sorted(in_the_way)
+
+
+def move_runs(d, runs_, delta):
+    delta, in_the_way = move_check(d, runs_, delta)
+    if delta == 0 or in_the_way:
         return {}
-    target = [f + delta for f in run]
-    if _taken(d, c["type"], skip={(cid, f) for f in run}) & set(target):
-        return {}
-    c["frames"] = sorted((set(c["frames"]) - set(run)) | set(target))
-    return dict(zip(run, target))
+    moved = {}
+    for cid, run in runs_:
+        moved.setdefault(cid, {}).update({f: f + delta for f in run})
+    for cid, mapping in moved.items():
+        c = _find(d, "constraints", cid)
+        c["frames"] = sorted((set(c["frames"]) - set(mapping)) | set(mapping.values()))
+    return moved
 
 
 def add_range(d, ctype, first, last):
