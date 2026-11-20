@@ -417,7 +417,39 @@ LIMBS = {
 LIMB_INDICES = [tuple(JOINT_NAMES.index(j) for j in limb) for limb in LIMBS.values()]
 IK_JOINTS = tuple(j for limb in LIMBS.values() for j in limb)
 FK_JOINTS = tuple(j for j in JOINT_NAMES if j != "Hips" and j not in IK_JOINTS)
-FK_HIDDEN = tuple(j for j in FK_JOINTS if j.endswith("End") or j in ("Jaw", "LeftEye", "RightEye"))
+FINGER_ROOTS = {
+    f"{side}Hand{finger}{1 if finger == 'Thumb' else 2}": f"{s}_{finger.lower()}Root"
+    for side, s in (("Left", "L"), ("Right", "R"))
+    for finger in ("Thumb", "Index", "Middle", "Ring", "Pinky")
+}
+FINGER_CIRCLES = tuple(j for j in FK_JOINTS if "Hand" in j and j[-1].isdigit() and j not in FINGER_ROOTS)
+FINGER_SELECTORS = {
+    f"{s}_{finger.lower()}_selector": tuple(
+        j
+        for j in FINGER_CIRCLES
+        if j.startswith(f"{side}Hand{finger}") and int(j[-1]) > (1 if finger == "Thumb" else 2)
+    )
+    for side, s in (("Left", "L"), ("Right", "R"))
+    for finger in ("Thumb", "Index", "Middle", "Ring", "Pinky")
+}
+FINGER_BACK_NORMALS = {
+    "Thumb": (0.008, 0.678, 0.735),
+    "Index": (0.0, 0.991, 0.135),
+    "Middle": (0.0, 1.0, -0.003),
+    "Ring": (0.0, 1.0, 0.001),
+    "Pinky": (0.0, 1.0, 0.012),
+}
+
+
+def finger_back_normal(selector):
+    side, finger = selector.split("_")[:2]
+    x, y, z = FINGER_BACK_NORMALS[finger.capitalize()]
+    return (x if side == "L" else -x, y, z)
+
+
+FK_HIDDEN = tuple(
+    j for j in FK_JOINTS if j.endswith("End") or j in ("Jaw", "LeftEye", "RightEye") or j in FINGER_CIRCLES
+)
 
 
 def _fk_control_names():
@@ -445,12 +477,22 @@ def _fk_control_names():
                 if j.startswith(f"{side}Hand{finger}"):
                     part = j[len(f"{side}Hand{finger}") :]
                     names[j] = f"{s}_{finger.lower()}End" if part == "End" else f"{s}_{finger.lower()}_{int(part):02d}"
+    names.update(FINGER_ROOTS)
     return {j: names[j] + "_fk" for j in FK_JOINTS}
 
 
 FK_CONTROL = _fk_control_names()
 FK_CONTROLS = tuple(FK_CONTROL[j] for j in FK_JOINTS if j not in FK_HIDDEN)
 ROOT_CONTROL, PELVIS_CONTROL = "C_root_ctrl", "C_pelvis_ctrl"
+COG_CONTROL = "C_cog_ctrl"
+COG_FRACTION = (1.00838 - 0.9578) / (1.2108 - 0.9578)
+SPINE_BASE = "C_cog_spineBase"
+
+
+def cog_offset():
+    """cog at rest relative to the hips"""
+    rest = rest_positions()
+    return (rest[JOINT_NAMES.index("Chest")] - rest[0]) * COG_FRACTION
 
 
 REST_TRANSFORM = "rest_transform"

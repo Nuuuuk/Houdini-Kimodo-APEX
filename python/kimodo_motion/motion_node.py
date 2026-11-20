@@ -120,7 +120,7 @@ def pose_hint(node):
     hands, feet = sum(t.endswith("hand") for t in types), sum(t.endswith("foot") for t in types)
     parts = [("the hand", "both hands")[hands - 1]] if hands else []
     parts += [("the foot", "both feet")[feet - 1]] if feet else []
-    parts += ["pelvis", "heading"] if hands or feet else []
+    parts += ["COG", "heading"] if hands or feet else []
     parts += ["the Root disk's place on the ground"] if "root2d" in types else []
     labels = [TYPE_LABELS[t] for t in types]
     names = labels[0] if len(labels) == 1 else ", ".join(labels[:-1]) + " and " + labels[-1]
@@ -1217,8 +1217,9 @@ def show_pinned_controls(node, viewer):
             ac.setControlTemplateEnabled(template, sorted(current - disabled), True)
             ac.setControlTemplateEnabled(template, sorted(disabled), False)
         state.runSceneCallbacks(force=True)
+    selectable = pinned | (rig.selected_by_selectors() if not pinned.isdisjoint(skeleton.FINGER_SELECTORS) else set())
     selected = list(state.control_selection)
-    still = [path for path in selected if path.rsplit("/", 1)[-1] in pinned]
+    still = [path for path in selected if path.rsplit("/", 1)[-1] in selectable]
     if len(still) != len(selected):
         viewer.runStateCommand(
             "selectControls",
