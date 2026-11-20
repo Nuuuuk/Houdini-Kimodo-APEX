@@ -65,7 +65,9 @@ _bases = {}
 
 def tag_for(node, source):
     """tag of a stash built in this session for a source"""
-    return f"{source}|{node.evalParm('duration'):g}|{SESSION}"
+    from . import motion_node
+
+    return f"{source}|{motion_node.motion_frames(node)}|{SESSION}"
 
 
 def _cooked(node, name):
@@ -113,7 +115,9 @@ def base(node, source):
         return kept[tag]
     top = hou.Geometry(_cooked(node, BAKE))
     top.deletePrims([p for p in top.prims() if p.attribValue("name") != "animation"])
-    frames = int(round(node.evalParm("duration") * doc.FPS))
+    from . import motion_node
+
+    frames = motion_node.motion_frames(node)
     found = channels(top)
     if not found or any(len(prim.keyFrames()) != frames for prim in found.values()):
         raise NotReady("the bake does not have a key on every frame")
@@ -205,7 +209,9 @@ def put_frames(node, source, baked=(), freed=()):
 
 
 def stash_table(node):
-    return table(stash(node), int(round(node.evalParm("duration") * doc.FPS)))
+    from . import motion_node
+
+    return table(stash(node), motion_node.motion_frames(node))
 
 
 _TARGETS = {

@@ -9,11 +9,12 @@ from . import doc, motion_node, panel_parts, rig, timeline, timeline_edit
 
 TAIL = 2 * doc.FPS
 EDGE = 5
+PLAYHEAD_REACH = 4
 
 HINTS = {
     "prompts": "Prompts: click empty space to add · double-click to edit · drag the right edge for length · "
     "right-click to delete",
-    "constraints": "Constraints: click a track for a keyframe at the current frame · Ctrl+drag for a range · "
+    "constraints": "Constraints: click a track for a keyframe at that frame · Ctrl+drag for a range · "
     "drag to move · right-click to delete or change type",
     "ruler": "Ruler: click or drag to set the frame · wheel pans · Shift+wheel zooms · Space plays · "
     "Left/Right step a frame",
@@ -27,6 +28,8 @@ class Canvas(panel_parts.TimelineCanvas):
     prompt_text_requested = QtCore.Signal(str, str)
     prompt_resize_requested = QtCore.Signal(str, int)
     prompt_delete_requested = QtCore.Signal(str)
+    prompt_select_requested = QtCore.Signal(str)
+    add_at_requested = QtCore.Signal(str, int)
     run_move_requested = QtCore.Signal(str, object, int)
     run_delete_requested = QtCore.Signal(str, object)
     range_requested = QtCore.Signal(str, int, int)
@@ -39,6 +42,7 @@ class Canvas(panel_parts.TimelineCanvas):
         self.drag = None
         self.preview = None
         self.editor, self.editing = None, None
+        self.selected = None
         self.hint = ""
         self.zoom = 1.0
         self.smooth_path = False
@@ -161,10 +165,26 @@ class Canvas(panel_parts.TimelineCanvas):
                     found = c, run
         return found or (None, None)
 
+    def on_playhead(self, pos):
+        """on the current frame's line with nothing else under it"""
+        row = self.row_at(pos)
+        if abs(pos.x() - self.frame_x(self.frame)) > PLAYHEAD_REACH or row is None or row == -1:
+            return False
+        return self.prompt_at(pos)[0] is None if row == 0 else self.run_at(pos)[0] is None
+
     def mousePressEvent(self, event):
         pos = event.position().toPoint()
         self.setFocus()
         row = self.row_at(pos)
+        if event.button() == QtCore.Qt.LeftButton and not event.modifiers() and self.on_playhead(pos):
+            self.drag = {
+                "kind": "playhead",
+                "type": panel_parts.TRACK_TYPES[row - 1] if row >= 1 else None,
+                "frame": self.frame,
+                "x": pos.x(),
+                "moved": False,
+            }
+            return
         if row and row >= 1:
             return self.press_track(event, pos, panel_parts.TRACK_TYPES[row - 1])
         if row == -1 and event.button() == QtCore.Qt.LeftButton:
@@ -193,6 +213,8 @@ class Canvas(panel_parts.TimelineCanvas):
                 }
             elif pr is None:
                 self.drag = {"kind": "add"}
+            elif pr["id"] != self.selected:
+                self.prompt_select_requested.emit(pr["id"])
 
     def press_track(self, event, pos, ctype):
         c, run = self.run_at(pos)
@@ -219,7 +241,7 @@ class Canvas(panel_parts.TimelineCanvas):
             elif c is not None:
                 self.drag = {"kind": "move", "c": c, "run": run, "x": pos.x(), "delta": 0, "moved": False, "ok": True}
             else:
-                self.drag = {"kind": "key", "type": ctype}
+                self.drag = {"kind": "key", "type": ctype, "frame": frame}
             self.update()
 
     def drag_track(self, drag, pos):
@@ -249,10 +271,14 @@ class Canvas(panel_parts.TimelineCanvas):
             self.drag_track(drag, pos)
         elif drag is not None and drag["kind"] == "scrub":
             self.frame_requested.emit(self.frame_at(pos.x()))
+        elif drag is not None and drag["kind"] == "playhead":
+            drag["moved"] = drag["moved"] or abs(pos.x() - drag["x"]) > 3
+            if drag["moved"]:
+                self.frame_requested.emit(self.frame_at(pos.x()))
         elif drag is None:
             row = self.row_at(pos)
             edge = row == 0 and self.prompt_at(pos)[1]
-            self.setCursor(QtCore.Qt.SizeHorCursor if edge else QtCore.Qt.ArrowCursor)
+            self.setCursor(QtCore.Qt.SizeHorCursor if edge or self.on_playhead(pos) else QtCore.Qt.ArrowCursor)
             self.set_hint("prompts" if row == 0 else "ruler" if row == -1 else "constraints" if row else "")
         elif drag["kind"] == "resize":
             frames = timeline.clamp_prompt_frames(round(pos.x() / self.scale()) - drag["start"])
@@ -271,10 +297,12 @@ class Canvas(panel_parts.TimelineCanvas):
             before = next(p["end_frame"] - p["start_frame"] for p in self.prompts if p["id"] == drag["id"])
             if drag["frames"] != before:
                 self.prompt_resize_requested.emit(drag["id"], drag["frames"])
+        elif drag["kind"] == "playhead" and not drag["moved"] and drag["type"] is not None:
+            self.add_at_requested.emit(drag["type"], drag["frame"])
         elif drag["kind"] == "add" and self.row_at(pos) == 0 and self.prompt_at(pos)[0] is None:
             self.prompt_add_requested.emit()
         elif drag["kind"] == "key" or (drag["kind"] == "range" and drag["first"] == drag["last"]):
-            self.add_requested.emit(drag["type"])
+            self.add_at_requested.emit(drag["type"], drag["frame"] if drag["kind"] == "key" else drag["first"])
         elif drag["kind"] == "range":
             self.range_requested.emit(drag["type"], drag["first"], drag["last"])
         elif drag["kind"] == "move" and not drag["moved"]:
@@ -317,6 +345,7 @@ class Canvas(panel_parts.TimelineCanvas):
         editor.show()
         editor.setFocus()
         self.editor, self.editing = editor, pid
+        QtWidgets.QApplication.instance().installEventFilter(self)
 
     def finish_edit(self, pid):
         editor = self.editor
@@ -330,11 +359,20 @@ class Canvas(panel_parts.TimelineCanvas):
 
     def close_editor(self):
         editor, self.editor = self.editor, None
+        QtWidgets.QApplication.instance().removeEventFilter(self)
         if editor is not None:
             editor.hide()
             editor.deleteLater()
 
     def eventFilter(self, obj, event):
+        if (
+            self.editor is not None
+            and event.type() == QtCore.QEvent.MouseButtonPress
+            and isinstance(obj, QtWidgets.QWidget)
+            and obj is not self.editor
+            and not self.editor.isAncestorOf(obj)
+        ):
+            self.finish_edit(self.editing)
         if obj is self.editor and event.type() in (QtCore.QEvent.KeyPress, QtCore.QEvent.ShortcutOverride):
             key = event.key()
             if key in (QtCore.Qt.Key_Escape, QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter):
@@ -356,6 +394,9 @@ class Canvas(panel_parts.TimelineCanvas):
             p.fillRect(0, ruler_h + i * row_h, self.width(), row_h - 1, pal.color(role))
         p.fillRect(end_x, 0, self.width() - end_x, self.height(), QtGui.QColor(0, 0, 0, 70))
         self.paint_ruler(p, text, end_x)
+        x = int(self.frame_x(self.frame))
+        p.setPen(QtGui.QPen(QtGui.QColor(230, 90, 60), 2))
+        p.drawLine(x, 0, x, self.height())
         for pr in prompts:
             self.paint_prompt(p, pr)
         p.setRenderHint(QtGui.QPainter.Antialiasing)
@@ -374,9 +415,6 @@ class Canvas(panel_parts.TimelineCanvas):
             lo, hi = sorted((drag["first"], drag["last"]))
             self.paint_constraint(p, {"type": drag["type"]}, list(range(lo, hi + 1)), 150)
         p.setRenderHint(QtGui.QPainter.Antialiasing, False)
-        x = int(self.frame_x(self.frame))
-        p.setPen(QtGui.QPen(QtGui.QColor(230, 90, 60), 2))
-        p.drawLine(x, 0, x, self.height())
         p.end()
 
     def paint_ruler(self, p, color, end_x):
@@ -394,7 +432,7 @@ class Canvas(panel_parts.TimelineCanvas):
 
     def paint_prompt(self, p, pr):
         rect = self.prompt_rect(pr)
-        p.fillRect(rect, QtGui.QColor(70, 120, 200))
+        p.fillRect(rect, QtGui.QColor(70, 120, 200) if pr["id"] == self.selected else QtGui.QColor(50, 86, 145))
         p.fillRect(rect.right() - 2, rect.top(), 3, rect.height(), QtGui.QColor(150, 190, 245))
         p.setPen(QtGui.QColor(255, 255, 255))
         fm = p.fontMetrics()
@@ -449,6 +487,8 @@ class Panel(panel_parts.KimodoPanel):
         canvas.prompt_text_requested.connect(lambda pid, text: self.edit(timeline_edit.set_prompt_text, pid, text))
         canvas.prompt_resize_requested.connect(lambda pid, n: self.edit(timeline_edit.resize_prompt, pid, n))
         canvas.prompt_delete_requested.connect(lambda pid: self.edit(timeline_edit.delete_prompt, pid))
+        canvas.prompt_select_requested.connect(lambda pid: self.edit(timeline_edit.select_prompt, pid))
+        canvas.add_at_requested.connect(lambda ctype, frame: self.with_node(motion_node.add_constraint, ctype, frame))
         canvas.run_move_requested.connect(lambda cid, run, delta: self.edit(timeline_edit.move_run, cid, run, delta))
         canvas.run_delete_requested.connect(lambda cid, run: self.edit(timeline_edit.delete_run, cid, run))
         canvas.range_requested.connect(lambda ctype, a, b: self.edit(timeline_edit.add_range, ctype, a, b))
@@ -456,13 +496,6 @@ class Panel(panel_parts.KimodoPanel):
         canvas.hint_changed.connect(self.show_hover_hint)
         canvas.play_requested.connect(self.toggle_play)
         canvas.step_requested.connect(lambda step: hou.setFrame(max(int(round(hou.frame())) + step, 1)))
-        self.generate_button = QtWidgets.QPushButton("Generate")
-        self.generate_button.setToolTip("Generate with the node's settings; Cancel while it runs.")
-        self.generate_button.clicked.connect(self.generate_or_cancel)
-        row = QtWidgets.QHBoxLayout()
-        row.addStretch(1)
-        row.addWidget(self.generate_button, 0, QtCore.Qt.AlignTop)
-        self.status.layout().insertLayout(0, row)
         self.guide_key = None
         self.playbar_callback = None
         if hou.isUIAvailable():
@@ -474,17 +507,21 @@ class Panel(panel_parts.KimodoPanel):
         super().refresh()
         node = self.node
         try:
-            busy = node is not None and bool(node.evalParm("busy"))
+            if node is not None:
+                node.path()
         except hou.ObjectWasDeleted:
-            node, busy = None, False
+            node = None
         self.timeline.setEnabled(node is not None)
-        self.generate_button.setEnabled(node is not None)
-        self.generate_button.setText("Cancel" if busy else "Generate")
         if node is None:
             self.status.show_hint("Select a Kimodo Motion node.")
         else:
-            d = motion_node.read_doc(node)
             self.timeline.canvas.set_smooth_path(bool(node.evalParm("smooth_root_path")))
+            d = self.doc
+            if d is not None and d["prompts"]:
+                selected = d["prompts"][motion_node.selected_prompt(node, d)]["id"]
+                if selected != self.timeline.canvas.selected:
+                    self.timeline.canvas.selected = selected
+                    self.timeline.canvas.update()
             key = (
                 node.parm("kimodo_doc").unexpandedString(),
                 node.parm("kimodo_poses").unexpandedString(),
@@ -506,11 +543,6 @@ class Panel(panel_parts.KimodoPanel):
     def toggle_play(self):
         if hou.isUIAvailable():
             hou.playbar.stop() if hou.playbar.isPlaying() else hou.playbar.play()
-
-    def generate_or_cancel(self):
-        if self.node is not None:
-            motion_node.cancel(self.node) if self.node.evalParm("busy") else motion_node.generate(self.node)
-            self.refresh()
 
     def close_panel(self):
         if self.playbar_callback is not None:

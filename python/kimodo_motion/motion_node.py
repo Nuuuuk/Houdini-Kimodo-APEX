@@ -136,18 +136,25 @@ def clear_error(node):
         set_status(node, "Error dismissed.")
 
 
+def selected_prompt(node, d):
+    """index of the selected clip, always one"""
+    return min(max(node.evalParm("selected_prompt"), 0), len(d["prompts"]) - 1)
+
+
 def shown_prompts(node, d):
-    if len(d["prompts"]) != 1:
+    if not d["prompts"]:
         return d["prompts"]
-    frames = int(round(node.evalParm("duration") * doc.FPS))
-    return [
-        {
-            "id": d["prompts"][0]["id"],
-            "text": node.parm("prompt").unexpandedString(),
-            "start_frame": 0,
-            "end_frame": frames,
-        }
-    ]
+    selected, start, out = selected_prompt(node, d), 0, []
+    for i, p in enumerate(d["prompts"]):
+        length = int(round(node.evalParm("duration") * doc.FPS)) if i == selected else p["end_frame"] - p["start_frame"]
+        text = node.parm("prompt").unexpandedString() if i == selected else p["text"]
+        out.append({"id": p["id"], "text": text, "start_frame": start, "end_frame": start + length})
+        start += length
+    return out
+
+
+def motion_frames(node):
+    return doc.total_frames({"prompts": shown_prompts(node, read_doc(node))})
 
 
 def doc_from_parms(node):
@@ -332,6 +339,9 @@ def _interruptible(text, long):
 def ensure_rig(node):
     """give the rig its animation for what the node shows, if it doesn't have it"""
     source = shown_result(node)
+    if node.evalParm("motion_frames") != motion_frames(node):
+        with hou.undos.disabler():
+            node.parm("motion_frames").set(motion_frames(node))
     if rig.current(node, source):
         return False
     frames = [f for f in constraint_frames(read_doc(node)) if f in _raw_poses(node)]

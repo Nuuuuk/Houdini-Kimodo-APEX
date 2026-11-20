@@ -28,16 +28,20 @@ def _settle(node):
     motion_node.sync_poses(node)
 
 
-def _write_prompts(node, d, label):
+def _write_prompts(node, d, label, selected=None):
     """write a doc whose clips changed, and which one is selected"""
     prompts, total = d["prompts"], doc.total_frames(d)
+    ids = [p["id"] for p in prompts]
+    if selected is None:
+        old = motion_node.read_doc(node)
+        i = motion_node.selected_prompt(node, old)
+        selected = old["prompts"][i]["id"] if old["prompts"][i]["id"] in ids else ids[min(i, len(ids) - 1)]
+    index = ids.index(selected)
     with hou.undos.group(motion_node.OWN_UNDO + label):
         motion_node.write_doc(node, d)
-        if len(prompts) == 1:
-            node.parm("prompt").set(prompts[0]["text"])
-        node.parm("duration").set(total / doc.FPS)
-        if node.parm("num_prompts") is not None:
-            node.parm("num_prompts").set(len(prompts))
+        node.parm("selected_prompt").set(index)
+        node.parm("prompt").set(prompts[index]["text"])
+        node.parm("duration").set((prompts[index]["end_frame"] - prompts[index]["start_frame"]) / doc.FPS)
         raw = motion_node._raw_poses(node)
         if any(f >= total for f in raw):
             motion_node.write_raw_poses(node, {f: p for f, p in raw.items() if f < total}, record=True)
@@ -49,9 +53,22 @@ def add_prompt(node):
     _settle(node)
     d = current_doc(node)
     pid = timeline.add_prompt(d)
-    _write_prompts(node, d, "add prompt")
+    _write_prompts(node, d, "add prompt", selected=pid)
     motion_node.set_status(node, f"Prompt added. The motion is now {_seconds(doc.total_frames(d))}.")
     return pid
+
+
+def select_prompt(node, pid):
+    d = current_doc(node)
+    if d["prompts"][motion_node.selected_prompt(node, d)]["id"] == pid:
+        return
+    index = [p["id"] for p in d["prompts"]].index(pid)
+    with hou.undos.group(motion_node.OWN_UNDO + f"select prompt {index + 1}"):
+        motion_node.write_doc(node, d)
+        node.parm("selected_prompt").set(index)
+        node.parm("prompt").set(d["prompts"][index]["text"])
+        node.parm("duration").set((d["prompts"][index]["end_frame"] - d["prompts"][index]["start_frame"]) / doc.FPS)
+    motion_node._own_step()
 
 
 def set_prompt_text(node, pid, text):

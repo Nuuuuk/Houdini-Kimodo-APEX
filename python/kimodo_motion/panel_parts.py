@@ -92,7 +92,6 @@ class TrackLabels(FontSized):
 
 
 class TimelineCanvas(FontSized):
-    add_requested = QtCore.Signal(str)
     delete_requested = QtCore.Signal(str)
     type_requested = QtCore.Signal(str, str)
     frame_requested = QtCore.Signal(int)
@@ -271,9 +270,6 @@ class KimodoPanel(QtWidgets.QWidget):
         self.parm_editor_factory = parm_editor_factory or (lambda node: hou.qt.ParmDialog(node, compact=True))
         self.timeline = TimelineArea(canvas)
         canvas = self.timeline.canvas
-        canvas.add_requested.connect(
-            lambda ctype: self.with_node(motion_node.add_constraint, ctype, int(round(hou.frame())) - 1)
-        )
         canvas.delete_requested.connect(lambda cid: self.with_node(motion_node.delete_constraint, cid))
         canvas.type_requested.connect(lambda cid, ctype: self.with_node(motion_node.set_constraint_type, cid, ctype))
         canvas.frame_requested.connect(lambda frame: hou.setFrame(frame + 1))
