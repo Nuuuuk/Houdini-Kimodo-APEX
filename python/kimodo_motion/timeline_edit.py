@@ -95,11 +95,12 @@ def delete_prompt(node, pid):
     motion_node.set_status(node, f"Prompt deleted. The motion is now {_seconds(doc.total_frames(d))}." + _dropped_text(dropped))
 
 
-def _write_constraints(node, before, after, mapping, label):
+def _write_constraints(node, before, after, mapping, label, poses=None):
     was, now = motion_node.types_at(before), motion_node.types_at(after)
     old = motion_node._raw_poses(node)
     raw = {f: p for f, p in old.items() if f in now}
     raw.update({new: old[f] for f, new in mapping.items() if f in old})
+    raw.update(poses or {})
     fresh = [f for f in now if f not in raw]
     for f in fresh:
         raw[f] = motion_node.raw_pose(motion_node.base_pose(node, f))
@@ -127,26 +128,18 @@ def move_runs(node, runs, delta):
     before = current_doc(node)
     after = copy.deepcopy(before)
     runs = [(cid, list(run)) for cid, run in runs]
+    same_type = timeline.move_check(before, runs, delta)[1]
     moved = timeline.move_runs(after, runs, delta)
     if not moved:
-        delta, in_the_way = timeline.move_check(before, runs, delta)
-        if in_the_way:
-            ctype = in_the_way[0][0]
-            frames = [f for t, f in in_the_way if t == ctype]
-            motion_node.set_status(
-                node,
-                f"Not moved: {_frames_text(frames)} already {'has' if len(frames) == 1 else 'have'} a "
-                f"{motion_node.TYPE_LABELS[ctype]} constraint.",
-            )
-        else:
-            motion_node.set_status(node, "Not moved: " + ("it is" if len(runs) == 1 else "they are") + " at the end of the motion.")
+        motion_node.set_status(node, "Not moved: " + ("it is" if len(runs) == 1 else "they are") + " at the end of the motion.")
         return {}
     mapping = {}
     for cid, frames in moved.items():
         mapping.update(frames)
         next(c for c in after["constraints"] if c["id"] == cid).pop("auto", None)
-    staying = {f for c in before["constraints"] for f in c["frames"] if f not in moved.get(c["id"], {})}
-    replaced = sorted(set(mapping.values()) & staying)
+    landed = {f for frames in moved.values() for f in frames.values()}
+    staying = {f for c in after["constraints"] for f in c["frames"] if c["id"] not in moved or f not in landed}
+    replaced = sorted(landed & staying)
     if len(runs) == 1:
         c = next(c for c in after["constraints"] if c["id"] == runs[0][0])
         where = _span_text(sorted(mapping.values()))
@@ -164,6 +157,13 @@ def move_runs(node, runs, delta):
         )
     elif replaced:
         text += f" {'Its' if len(runs) == 1 else 'Moved'} poses replaced the ones already on {len(replaced)} frames ({replaced[0] + 1} to {replaced[-1] + 1})."
+    if same_type:
+        kinds = sorted({t for t, _ in same_type})
+        what = " and ".join(motion_node.TYPE_LABELS[t] for t in kinds)
+        frames = sorted(f for _, f in same_type)
+        text += (
+            f" It replaced the {what} {'constraint' if len(frames) == 1 else 'constraints'} on {_frames_text(frames)}."
+        )
     motion_node.set_status(node, text)
     return moved
 
@@ -226,6 +226,101 @@ def delete_run(node, cid, run):
         node, before, after, {}, f"delete {motion_node.TYPE_LABELS[ctype]} constraint on {_span_text(list(run))}"
     )
     motion_node.set_status(node, f"{motion_node.TYPE_LABELS[ctype]} constraint on {_span_text(list(run))} deleted.")
+
+
+def delete_runs(node, runs, verb="delete"):
+    runs = [(cid, list(run)) for cid, run in runs]
+    if len(runs) == 1 and verb == "delete":
+        delete_run(node, *runs[0])
+        return True
+    _settle(node)
+    before = current_doc(node)
+    after = copy.deepcopy(before)
+    for cid, run in runs:
+        if any(c["id"] == cid for c in after["constraints"]):
+            timeline.delete_run(after, cid, run)
+    if after["constraints"] == before["constraints"]:
+        return False
+    _write_constraints(node, before, after, {}, f"{verb} {_plural(len(runs), 'marker')}")
+    motion_node.set_status(node, f"{_plural(len(runs), 'marker')} {'cut' if verb == 'cut' else 'deleted'}.")
+    return True
+
+
+def _plural(n, word):
+    return f"{n} {word}{'' if n == 1 else 's'}"
+
+
+_copied_markers = []
+
+
+def copy_runs(node, runs, quiet=False):
+    """quiet leaves the status alone"""
+    _settle(node)
+    d, raw = current_doc(node), motion_node._raw_poses(node)
+    found = [
+        (next(c for c in d["constraints"] if c["id"] == cid), list(run))
+        for cid, run in runs
+        if any(c["id"] == cid for c in d["constraints"])
+    ]
+    if not found:
+        return 0
+    first = min(run[0] for _, run in found)
+    _copied_markers[:] = [
+        {
+            "type": c["type"],
+            "heading": bool(c.get("heading")),
+            "frames": [f - first for f in run],
+            "poses": [raw.get(f) or motion_node.raw_pose(motion_node.base_pose(node, f)) for f in run],
+        }
+        for c, run in found
+    ]
+    if not quiet:
+        motion_node.set_status(node, f"{_plural(len(found), 'marker')} copied. Ctrl+V pastes at the current frame.")
+    return len(found)
+
+
+def cut_runs(node, runs):
+    return copy_runs(node, runs, quiet=True) and delete_runs(node, runs, verb="cut")
+
+
+def paste_runs(node, frame):
+    """the earliest copied marker lands on frame, the rest keep their distance"""
+    _settle(node)
+    if not _copied_markers:
+        motion_node.set_status(node, "Nothing copied yet: select markers and press Ctrl+C.")
+        return []
+    before = current_doc(node)
+    after = copy.deepcopy(before)
+    total = doc.total_frames(after)
+    poses, pasted, dropped, replaced = {}, [], 0, 0
+    for m in _copied_markers:
+        keep = [(frame + off, pose) for off, pose in zip(m["frames"], m["poses"]) if 0 <= frame + off < total]
+        dropped += len(m["frames"]) - len(keep)
+        if not keep:
+            continue
+        targets = [f for f, _ in keep]
+        for c in after["constraints"]:
+            if c["type"] == m["type"]:
+                replaced += len(set(c["frames"]) & set(targets))
+                c["frames"] = [f for f in c["frames"] if f not in targets]
+        after["constraints"] = [c for c in after["constraints"] if c["frames"]]
+        entry = {"id": timeline._new_id(after, "constraints", "c"), "type": m["type"], "frames": targets}
+        if m["heading"]:
+            entry["heading"] = True
+        after["constraints"].append(entry)
+        poses.update(keep)
+        pasted.append((entry["id"], targets))
+    if not pasted:
+        motion_node.set_status(node, f"Not pasted: frame {frame + 1} would put every copied marker past the end of the motion.")
+        return []
+    _write_constraints(node, before, after, {}, f"paste {_plural(len(pasted), 'marker')} at frame {frame + 1}", poses)
+    text = f"{_plural(len(pasted), 'marker')} pasted at frame {frame + 1}."
+    if replaced:
+        text += f" {_plural(replaced, 'frame')} of the same type replaced."
+    if dropped:
+        text += f" {_plural(dropped, 'frame')} past the end of the motion dropped."
+    motion_node.set_status(node, text)
+    return pasted
 
 
 def set_heading(node, cid, on):

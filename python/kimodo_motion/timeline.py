@@ -97,15 +97,21 @@ def move_check(d, runs_, delta):
 
 
 def move_runs(d, runs_, delta):
-    delta, in_the_way = move_check(d, runs_, delta)
-    if delta == 0 or in_the_way:
+    delta, replaced = move_check(d, runs_, delta)
+    if delta == 0:
         return {}
+    moving = {(cid, f) for cid, run in runs_ for f in run}
+    for ctype, frame in replaced:
+        for c in d["constraints"]:
+            if c["type"] == ctype and frame in c["frames"] and (c["id"], frame) not in moving:
+                c["frames"] = [f for f in c["frames"] if f != frame]
     moved = {}
     for cid, run in runs_:
         moved.setdefault(cid, {}).update({f: f + delta for f in run})
     for cid, mapping in moved.items():
         c = _find(d, "constraints", cid)
         c["frames"] = sorted((set(c["frames"]) - set(mapping)) | set(mapping.values()))
+    d["constraints"] = [c for c in d["constraints"] if c["frames"]]
     return moved
 
 

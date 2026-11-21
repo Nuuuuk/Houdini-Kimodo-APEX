@@ -14,7 +14,8 @@ PLAYHEAD_REACH = 4
 HINTS = {
     "prompts": "Prompts: click empty space to add · double-click to edit · drag the right edge for length · "
     "right-click to delete",
-    "constraints": "Constraints: click a track for a keyframe at that frame · click a marker to select it · "
+    "constraints": "Constraints: click a track for a keyframe at that frame · click a marker to select it · Delete "
+    "deletes the selected · Ctrl+C, Ctrl+X, Ctrl+V copy, cut and paste them · Ctrl+A selects all · "
     "Shift+click to add or remove · drag empty space to select · drag to move · "
     "Ctrl+drag for a range · right-click to reset, delete or change type",
     "ruler": "Ruler: click or drag to set the frame · wheel pans · Shift+wheel zooms · Space plays · "
@@ -22,6 +23,7 @@ HINTS = {
     "": "",
 }
 ZOOM_STEP, ZOOM_MIN, ZOOM_MAX = 1.25, 0.3, 8.0
+COPY_KEYS = (QtCore.Qt.Key_C, QtCore.Qt.Key_X, QtCore.Qt.Key_V, QtCore.Qt.Key_A)
 CLIP_RGB = (70, 120, 200)
 OUTLINE = 2.0
 MOVES_KEPT = 50
@@ -46,6 +48,10 @@ class Canvas(panel_parts.TimelineCanvas):
     selection_ended = QtCore.Signal()
     reset_requested = QtCore.Signal(object)
     run_delete_requested = QtCore.Signal(str, object)
+    runs_delete_requested = QtCore.Signal(object)
+    markers_copy_requested = QtCore.Signal(object, bool)
+    markers_cut_requested = QtCore.Signal(object)
+    markers_paste_requested = QtCore.Signal(int)
     range_requested = QtCore.Signal(str, int, int)
     heading_requested = QtCore.Signal(str, bool)
     play_requested = QtCore.Signal()
@@ -166,8 +172,33 @@ class Canvas(panel_parts.TimelineCanvas):
             self.selection_ended.emit()
         super().keyReleaseEvent(event)
 
+    def timeline_key(self, event):
+        """keys the timeline handles itself while it has focus"""
+        if event.key() in (QtCore.Qt.Key_Delete, QtCore.Qt.Key_Backspace):
+            return not event.modifiers()
+        return event.key() in COPY_KEYS and event.modifiers() == QtCore.Qt.ControlModifier
+
+    def event(self, event):
+        if event.type() == QtCore.QEvent.ShortcutOverride and self.timeline_key(event):
+            event.accept()
+            return True
+        return super().event(event)
+
     def keyPressEvent(self, event):
-        if event.key() == QtCore.Qt.Key_Space:
+        if self.timeline_key(event):
+            selected = [(c["id"], run) for c, run in self.marked_runs()]
+            if event.key() == QtCore.Qt.Key_Delete and selected:
+                self.runs_delete_requested.emit(selected)
+            elif event.key() == QtCore.Qt.Key_C and selected:
+                self.markers_copy_requested.emit(selected, False)
+            elif event.key() == QtCore.Qt.Key_X and selected:
+                self.markers_cut_requested.emit(selected)
+            elif event.key() == QtCore.Qt.Key_V:
+                self.markers_paste_requested.emit(self.frame)
+            elif event.key() == QtCore.Qt.Key_A:
+                self.marked = {(c["id"], f) for c in self.constraints for f in c["frames"]}
+                self.update()
+        elif event.key() == QtCore.Qt.Key_Space:
             self.play_requested.emit()
         elif event.key() in (QtCore.Qt.Key_Left, QtCore.Qt.Key_Right):
             self.step_requested.emit(-1 if event.key() == QtCore.Qt.Key_Left else 1)
@@ -307,6 +338,18 @@ class Canvas(panel_parts.TimelineCanvas):
         if event.button() == QtCore.Qt.RightButton:
             x = pos.x() / self.scale() - 0.5
             menu, actions = self.track_menu(c, ctype, min(run, key=lambda f: abs(f - x)) if c is not None else None)
+            for action in menu.actions():
+                if action.text() == "Copy Pose" and c is not None and self.is_marked(c, run):
+                    action.setText("Copy Selected Poses")
+                    actions[action] = lambda: self.markers_copy_requested.emit(
+                        [(m["id"], r) for m, r in self.marked_runs()], False
+                    )
+                elif action.text() == "Copy Pose" and c is not None:
+                    copy_one = actions[action]
+                    actions[action] = lambda copy_one=copy_one: (
+                        copy_one(),
+                        self.markers_copy_requested.emit([(c["id"], run)], True),
+                    )
             for i, action in enumerate(menu.actions()):
                 if action.text() == "Delete":
                     actions[action] = lambda: self.run_delete_requested.emit(c["id"], run)
@@ -366,14 +409,14 @@ class Canvas(panel_parts.TimelineCanvas):
                 return
             runs = [(c["id"], run) for c, run in drag["runs"]]
             shown = {"prompts": self.prompts, "constraints": self.constraints}
-            delta, in_the_way = timeline.move_check(shown, runs, round((pos.x() - drag["x"]) / self.scale()))
-            drag["delta"], drag["ok"] = delta, delta == 0 or not in_the_way
+            delta, replaced = timeline.move_check(shown, runs, round((pos.x() - drag["x"]) / self.scale()))
+            drag["delta"], drag["ok"] = delta, True
             where = (
                 f"Move to frame {drag['run'][0] + delta + 1}"
                 if len(runs) == 1
                 else f"Move {len(runs)} markers by {delta:+d} frames"
             )
-            self.set_hint(where + ("" if drag["ok"] else ": a constraint is in the way"))
+            self.set_hint(where + (f": replaces {len(replaced)} of the same type there" if replaced else ""))
         self.update()
 
     def mouseMoveEvent(self, event):
@@ -642,6 +685,10 @@ class Panel(panel_parts.KimodoPanel):
         canvas.selection_ended.connect(self.refresh)
         canvas.reset_requested.connect(lambda runs: self.edit(timeline_edit.reset_runs, runs))
         canvas.run_delete_requested.connect(lambda cid, run: self.edit(timeline_edit.delete_run, cid, run))
+        canvas.runs_delete_requested.connect(lambda runs: self.edit(timeline_edit.delete_runs, runs))
+        canvas.markers_copy_requested.connect(lambda runs, quiet: self.edit(timeline_edit.copy_runs, runs, quiet))
+        canvas.markers_cut_requested.connect(lambda runs: self.edit(timeline_edit.cut_runs, runs))
+        canvas.markers_paste_requested.connect(self.paste_markers)
         canvas.range_requested.connect(lambda ctype, a, b: self.edit(timeline_edit.add_range, ctype, a, b))
         canvas.heading_requested.connect(lambda cid, on: self.edit(timeline_edit.set_heading, cid, on))
         canvas.hint_changed.connect(self.show_hover_hint)
@@ -756,6 +803,13 @@ class Panel(panel_parts.KimodoPanel):
             canvas.update()
         else:
             canvas.remember_move(key, before)
+
+    def paste_markers(self, frame):
+        pasted = self.edit(timeline_edit.paste_runs, frame)
+        if pasted:
+            canvas = self.timeline.canvas
+            canvas.marked = {(cid, f) for cid, frames in pasted for f in frames}
+            canvas.update()
 
     def add_prompt(self):
         pid = self.edit(timeline_edit.add_prompt)
