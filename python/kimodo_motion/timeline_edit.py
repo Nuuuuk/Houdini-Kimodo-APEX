@@ -24,7 +24,6 @@ def _dropped_text(dropped):
 
 
 def _settle(node):
-    motion_node.follow_clip_parms(node)
     motion_node._flush(node)
     motion_node.sync_poses(node)
 
@@ -40,15 +39,12 @@ def _write_prompts(node, d, label, selected=None):
     index = ids.index(selected)
     with hou.undos.group(motion_node.OWN_UNDO + label):
         motion_node.write_doc(node, d)
-        with motion_node.clip_write(node):
+        if node.evalParm("selected_prompt") != index:
             node.parm("selected_prompt").set(index)
-            node.parm("prompt").set(prompts[index]["text"])
-            node.parm("duration").set((prompts[index]["end_frame"] - prompts[index]["start_frame"]) / doc.FPS)
         raw = motion_node._raw_poses(node)
         if any(f >= total for f in raw):
             motion_node.write_raw_poses(node, {f: p for f, p in raw.items() if f < total}, record=True)
     motion_node._own_step()
-    motion_node.clip_step_here(node)
     motion_node.update_unapplied(node)
 
 
@@ -65,12 +61,8 @@ def select_prompt(node, pid):
     d = current_doc(node)
     if d["prompts"][motion_node.selected_prompt(node, d)]["id"] == pid:
         return
-    index = [p["id"] for p in d["prompts"]].index(pid)
-    with hou.undos.disabler(), motion_node.clip_write(node):
-        motion_node.write_doc(node, d)
-        node.parm("selected_prompt").set(index)
-        node.parm("prompt").set(d["prompts"][index]["text"])
-        node.parm("duration").set((d["prompts"][index]["end_frame"] - d["prompts"][index]["start_frame"]) / doc.FPS)
+    with hou.undos.disabler():
+        node.parm("selected_prompt").set([p["id"] for p in d["prompts"]].index(pid))
 
 
 def set_prompt_text(node, pid, text):

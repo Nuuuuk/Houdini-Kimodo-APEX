@@ -5,7 +5,7 @@ import time
 import hou
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from . import doc, motion_node, rig
+from . import doc, motion_node, rig, timeline, timeline_edit
 
 TRACKS = ("Prompts", "Full-Body", "2D Root", "Left Hand", "Right Hand", "Left Foot", "Right Foot")
 TRACK_TYPES = ("fullbody", "root2d", "left-hand", "right-hand", "left-foot", "right-foot")
@@ -31,20 +31,6 @@ def paste_entries(ctype, frame):
     if ctype == "root2d":
         return [(f"Paste Root at Frame {n}", False)]
     return [(f"Paste Pose at Frame {n}", False)]
-
-
-def houdini_tooltip(widget, title, text, hotkey=""):
-    widget.setProperty("tooltip_text", f"{title}: {text}" + (f" Hotkey: {hotkey}." if hotkey else ""))
-    if not hou.isUIAvailable():
-        widget.setToolTip(text)
-        return None
-    tip = hou.qt.ToolTip()
-    tip.setTitle(title)
-    tip.setText(text)
-    if hotkey:
-        tip.setHotkey(hotkey)
-    tip.setTargetWidget(widget)
-    return tip
 
 
 class Metrics:
@@ -169,6 +155,24 @@ class TimelineArea(QtWidgets.QWidget):
         return self.minimumSizeHint()
 
 
+class HintLabel(QtWidgets.QLabel):
+    """always two lines high so the panel doesn't jump"""
+
+    def __init__(self):
+        super().__init__("")
+        self.setWordWrap(True)
+        self.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
+        self.fit()
+
+    def fit(self):
+        self.setMinimumHeight(2 * self.fontMetrics().lineSpacing())
+
+    def changeEvent(self, event):
+        if event.type() in (QtCore.QEvent.FontChange, QtCore.QEvent.StyleChange):
+            self.fit()
+        super().changeEvent(event)
+
+
 class StatusWidget(QtWidgets.QFrame):
     dismissed = QtCore.Signal()
 
@@ -188,8 +192,7 @@ class StatusWidget(QtWidgets.QFrame):
         head.addWidget(self.text, 1)
         head.addWidget(self.elapsed, 0, QtCore.Qt.AlignTop)
         col.addLayout(head)
-        self.hint = QtWidgets.QLabel("")
-        self.hint.setWordWrap(True)
+        self.hint = HintLabel()
         self.hint.setStyleSheet(f"color: {HINT_COLOR};")
         col.addWidget(self.hint)
         self.bar = QtWidgets.QProgressBar()
@@ -207,7 +210,6 @@ class StatusWidget(QtWidgets.QFrame):
         self.log_link = QtWidgets.QLabel()
         self.log_link.setOpenExternalLinks(True)
         dismiss = QtWidgets.QPushButton("Dismiss")
-        self.tips = [houdini_tooltip(dismiss, "Dismiss", "Clear the warning or error on the node.")]
         dismiss.clicked.connect(self.dismissed)
         actions.addWidget(self.log_link, 1)
         actions.addWidget(dismiss, 0)
@@ -260,12 +262,117 @@ class StatusWidget(QtWidgets.QFrame):
             self.log_link.setText(f'<a href="{url}">Open service.log</a>' if st["log"] else "")
 
 
-GENERATE_WIDTH = 290
+MENU_RIGHT = 310
+DIVIDER_SPACE = 8
 GENERATE_TALLER = 1.3
 
 
 def ui_scale():
     return hou.ui.globalScaleFactor() if hou.isUIAvailable() else 1.0
+
+
+class ClipFields(QtWidgets.QWidget):
+    LABEL_X = 6
+
+    def __init__(self):
+        super().__init__()
+        self.node = None
+        self.run = None
+        self.preview = None
+        self.prompt_label, self.duration_label = QtWidgets.QLabel("Prompt"), QtWidgets.QLabel("Duration (s)")
+        self.prompt, self.duration = QtWidgets.QLineEdit(), QtWidgets.QLineEdit()
+        self.slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.slider.setRange(doc.MIN_PROMPT_FRAMES, doc.MAX_PROMPT_FRAMES)
+        rows = QtWidgets.QVBoxLayout(self)
+        rows.setContentsMargins(self.LABEL_X, 0, self.LABEL_X, 0)
+        rows.setSpacing(4)
+        for widgets in ((self.prompt_label, self.prompt), (self.duration_label, self.duration, self.slider)):
+            row = QtWidgets.QHBoxLayout()
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(4)
+            for w in widgets:
+                row.addWidget(w, 1 if w in (self.prompt, self.slider) else 0)
+            rows.addLayout(row)
+        self.prompt.editingFinished.connect(self.commit_prompt)
+        self.duration.editingFinished.connect(self.commit_duration)
+        self.slider.valueChanged.connect(self.slid)
+        self.slider.sliderReleased.connect(self.slide_ended)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed)
+
+    def place(self, left):
+        label = max(left - self.LABEL_X - 4, 10)
+        number = max(round(self.duration.fontMetrics().horizontalAdvance("00.000") * 1.6), 40)
+        for w, size in ((self.prompt_label, label), (self.duration_label, label), (self.duration, number)):
+            if w.width() != size:
+                w.setFixedWidth(size)
+
+    def clip(self):
+        if self.node is None:
+            return None
+        d = motion_node.read_doc(self.node)
+        return d["prompts"][motion_node.selected_prompt(self.node, d)] if d["prompts"] else None
+
+    def refresh(self, node):
+        """show the selected clip unless a field is being typed in or dragged"""
+        self.node = node
+        clip = self.clip()
+        self.setEnabled(clip is not None)
+        if clip is None:
+            return
+        text, frames = clip["text"], clip["end_frame"] - clip["start_frame"]
+        if not self.prompt.isModified() and self.prompt.text() != text:
+            self.prompt.setText(text)
+            self.prompt.setCursorPosition(0)
+        if (
+            not self.duration.isModified()
+            and not self.slider.isSliderDown()
+            and self.duration.text() != f"{frames / doc.FPS:g}"
+        ):
+            self.duration.setText(f"{frames / doc.FPS:g}")
+        if not self.slider.isSliderDown() and self.slider.value() != frames:
+            self.slider.blockSignals(True)
+            self.slider.setValue(frames)
+            self.slider.blockSignals(False)
+
+    def commit_prompt(self):
+        self.prompt.setModified(False)
+        clip, text = self.clip(), self.prompt.text().strip()
+        if clip is not None and text and text != clip["text"] and self.run is not None:
+            self.run(timeline_edit.set_prompt_text, clip["id"], text)
+
+    def commit_duration(self):
+        self.duration.setModified(False)
+        clip = self.clip()
+        if clip is None:
+            return
+        try:
+            frames = timeline.clamp_prompt_frames(round(float(self.duration.text()) * doc.FPS))
+        except ValueError:
+            frames = clip["end_frame"] - clip["start_frame"]
+        self.resize_clip(clip, frames)
+        self.duration.setText(f"{frames / doc.FPS:g}")
+
+    def resize_clip(self, clip, frames):
+        if frames != clip["end_frame"] - clip["start_frame"] and self.run is not None:
+            self.run(timeline_edit.resize_prompt, clip["id"], frames)
+
+    def slid(self, frames):
+        clip = self.clip()
+        if clip is None:
+            return
+        self.duration.setText(f"{frames / doc.FPS:g}")
+        if self.slider.isSliderDown():
+            if self.preview is not None:
+                self.preview(clip["id"], frames)
+        else:
+            self.resize_clip(clip, frames)
+
+    def slide_ended(self):
+        clip = self.clip()
+        if self.preview is not None:
+            self.preview(None, None)
+        if clip is not None:
+            self.resize_clip(clip, self.slider.value())
 
 
 class KimodoPanel(QtWidgets.QWidget):
@@ -298,6 +405,17 @@ class KimodoPanel(QtWidgets.QWidget):
         self.generate_button.clicked.connect(self.press_generate)
         self.button_rows.addWidget(self.generate_button, 0, QtCore.Qt.AlignLeft)
         self.buttons.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed)
+        self.clip_fields = ClipFields()
+        self.divider = QtWidgets.QFrame()
+        self.divider.setFrameShape(QtWidgets.QFrame.HLine)
+        self.divider.setFrameShadow(QtWidgets.QFrame.Sunken)
+        self.divider_box = QtWidgets.QWidget()
+        around = QtWidgets.QVBoxLayout(self.divider_box)
+        around.setContentsMargins(0, DIVIDER_SPACE, 0, DIVIDER_SPACE)
+        around.addWidget(self.divider)
+        self.divider_box.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed)
+        self.clip_fields.run = self.edit_clip
+        self.clip_fields.preview = self.preview_clip
         fixed = QtWidgets.QSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed)
         self.timeline.setSizePolicy(fixed)
         self.status.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Maximum)
@@ -306,7 +424,9 @@ class KimodoPanel(QtWidgets.QWidget):
         self.stack.setSpacing(4)
         self.stack.addWidget(self.timeline, 0)
         self.stack.addWidget(self.status, 0)
+        self.stack.addWidget(self.clip_fields, 0)
         self.stack.addWidget(self.buttons, 0)
+        self.stack.addWidget(self.divider_box, 0)
         self.stack.addStretch(1)
         self.place_buttons()
         self.timer = QtCore.QTimer(self)
@@ -346,6 +466,7 @@ class KimodoPanel(QtWidgets.QWidget):
                 return
             self.status.show_status(motion_node.get_status(self.node))
             self.generate_button.setText("Cancel" if self.node.evalParm("busy") else "Generate")
+            self.clip_fields.refresh(self.node)
             self.place_buttons()
             self.status.show_hint(self.hover_hint or motion_node.pose_hint(self.node))
             text = self.node.parm("kimodo_doc").unexpandedString()
@@ -357,22 +478,44 @@ class KimodoPanel(QtWidgets.QWidget):
             if changed != canvas.changed:
                 canvas.changed = changed
                 canvas.update()
-            canvas.set_state(motion_node.shown_prompts(self.node, d), int(round(hou.frame())) - 1, d["constraints"])
+            canvas.set_state(d["prompts"], int(round(hou.frame())) - 1, d["constraints"])
         except (hou.ObjectWasDeleted, doc.DocError):
             self.node = None
         finally:
             self.refreshing = False
 
+    def buttons_right(self):
+        """where the parm editor's menus end"""
+        editor = self.parm_editor.mapTo(self, QtCore.QPoint(0, 0)).x() if self.parm_editor is not None else 0
+        return editor + round(MENU_RIGHT * ui_scale())
+
     def place_buttons(self):
-        scale = ui_scale()
         left = self.timeline.labels.width()
         if self.button_rows.contentsMargins().left() != left:
             self.button_rows.setContentsMargins(left, 0, 0, 0)
         size = QtCore.QSize(
-            round(GENERATE_WIDTH * scale), round(QtWidgets.QPushButton().sizeHint().height() * GENERATE_TALLER)
+            max(self.buttons_right() - left, 50), round(QtWidgets.QPushButton().sizeHint().height() * GENERATE_TALLER)
         )
         if self.generate_button.size() != size:
             self.generate_button.setFixedSize(size)
+        self.clip_fields.place(left)
+
+    def edit_clip(self, fn, *args):
+        self.with_node(fn, *args)
+        self.refresh()
+
+    def preview_clip(self, pid, frames):
+        """while duration is dragged the timeline shows the clip that long"""
+        canvas = self.timeline.canvas
+        if not hasattr(canvas, "preview"):
+            return
+        if pid is None:
+            canvas.preview = None
+        else:
+            shown = {"prompts": [dict(p) for p in canvas.prompts], "constraints": []}
+            timeline.resize_prompt(shown, pid, frames)
+            canvas.preview = shown["prompts"]
+        canvas.update()
 
     def press_generate(self):
         """generate, or cancel while a generation runs"""

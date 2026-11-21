@@ -208,6 +208,7 @@ def _state_class():
                     rig_geo.pointFloatAttribValues("transform"),
                     node.parm("kimodo_doc").unexpandedString(),
                     motion_node.shown_result(node),
+                    tuple(colors),
                 )
                 if key != self._pose_key:
                     self._pose_key = key

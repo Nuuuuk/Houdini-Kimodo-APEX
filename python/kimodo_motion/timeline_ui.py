@@ -43,6 +43,7 @@ class Canvas(panel_parts.TimelineCanvas):
     prompt_select_requested = QtCore.Signal(str)
     add_at_requested = QtCore.Signal(str, int)
     runs_move_requested = QtCore.Signal(object, int)
+    selection_ended = QtCore.Signal()
     reset_requested = QtCore.Signal(object)
     run_delete_requested = QtCore.Signal(str, object)
     range_requested = QtCore.Signal(str, int, int)
@@ -57,6 +58,7 @@ class Canvas(panel_parts.TimelineCanvas):
         self.editor, self.editing = None, None
         self.selected = None
         self.marked = set()
+        self.shifting = False
         self.resettable = False
         self.moves = []
         self.hint = ""
@@ -147,6 +149,22 @@ class Canvas(panel_parts.TimelineCanvas):
             bar = area.horizontalScrollBar()
             bar.setValue(bar.value() - delta)
         event.accept()
+
+    def busy_selecting(self):
+        """a box or move is dragged, or shift is held since a shift+click"""
+        if (
+            self.shifting
+            and hou.isUIAvailable()
+            and not QtWidgets.QApplication.queryKeyboardModifiers() & QtCore.Qt.ShiftModifier
+        ):
+            self.shifting = False
+        return self.drag is not None or self.shifting
+
+    def keyReleaseEvent(self, event):
+        if event.key() == QtCore.Qt.Key_Shift:
+            self.shifting = False
+            self.selection_ended.emit()
+        super().keyReleaseEvent(event)
 
     def keyPressEvent(self, event):
         if event.key() == QtCore.Qt.Key_Space:
@@ -243,6 +261,7 @@ class Canvas(panel_parts.TimelineCanvas):
         pos = event.position().toPoint()
         self.setFocus()
         row = self.row_at(pos)
+        self.shifting = bool(event.modifiers() & QtCore.Qt.ShiftModifier)
         if event.button() == QtCore.Qt.LeftButton and not event.modifiers() and self.on_playhead(pos):
             self.drag = {
                 "kind": "playhead",
@@ -422,6 +441,8 @@ class Canvas(panel_parts.TimelineCanvas):
             self.runs_move_requested.emit([(c["id"], run) for c, run in drag["runs"]], drag["delta"])
         self.update()
         self.mouseMoveEvent(event)
+        if not self.shifting:
+            self.selection_ended.emit()
 
     def mouseDoubleClickEvent(self, event):
         pos = event.position().toPoint()
@@ -618,6 +639,7 @@ class Panel(panel_parts.KimodoPanel):
         canvas.prompt_select_requested.connect(lambda pid: self.edit(timeline_edit.select_prompt, pid))
         canvas.add_at_requested.connect(lambda ctype, frame: self.with_node(motion_node.add_constraint, ctype, frame))
         canvas.runs_move_requested.connect(self.move_runs)
+        canvas.selection_ended.connect(self.refresh)
         canvas.reset_requested.connect(lambda runs: self.edit(timeline_edit.reset_runs, runs))
         canvas.run_delete_requested.connect(lambda cid, run: self.edit(timeline_edit.delete_run, cid, run))
         canvas.range_requested.connect(lambda ctype, a, b: self.edit(timeline_edit.add_range, ctype, a, b))
@@ -655,7 +677,6 @@ class Panel(panel_parts.KimodoPanel):
         if node is None:
             self.status.show_hint("Select a Kimodo Motion node.")
         else:
-            motion_node.follow_clip_parms(node)
             self.timeline.canvas.set_smooth_path(bool(node.evalParm("smooth_root_path")))
             d = self.doc
             canvas = self.timeline.canvas
@@ -666,7 +687,7 @@ class Panel(panel_parts.KimodoPanel):
                     canvas.update()
             canvas.resettable = motion_node.can_reset(node)
             self.reset_button.setEnabled(bool(canvas.marked) and canvas.can_reset(canvas.marked_runs()))
-            if motion_node.is_editing(node):
+            if motion_node.is_editing(node) and not canvas.busy_selecting():
                 posed = {(c["id"], f) for c in canvas.constraints for f in (timeline.run_at(c, canvas.frame) or ())}
                 if posed != canvas.marked:
                     canvas.marked = posed
