@@ -122,6 +122,8 @@ def _state_class():
         _label_boxes = None
         _title = STATE_LABEL
         _pose_lines = None
+        _mark_lines = None
+        _mark_key = None
         _pose_key = None
         _pelvis = None
 
@@ -238,6 +240,37 @@ def _state_class():
                     "the rig's own skeleton is shown.",
                 )
 
+        def _draw_mark(self, draw_handle, frame):
+            from kimodo_motion import motion_node
+
+            node = self.scene_node
+            if self._mark_lines is None or frame not in motion_node._headed(node) or not self._rig_skeletons():
+                return
+            try:
+                self._make_mark(draw_handle, frame)
+            except Exception as e:
+                self._mark_lines.show(False)
+                self._mark_lines = None
+                motion_node.set_status(node, f"Kimodo could not draw the heading's mark ({type(e).__name__}: {e}).")
+
+        def _make_mark(self, draw_handle, frame):
+            from kimodo_motion import motion_node, rig
+
+            node = self.scene_node
+            skel = self._rig_skeletons()[0]
+            rig_geo = self.scene.getGraphOutputData(skel.output_path, skel.data_key)
+            color = motion_node._marker_color(frame, motion_node.changed_frames(node))
+            key = (frame, rig_geo.pointFloatAttribValues("P"), rig_geo.pointFloatAttribValues("transform"), color)
+            if key != self._mark_key:
+                self._mark_key = key
+                geo = hou.Geometry()
+                geo.addAttrib(hou.attribType.Point, "Cd", tuple(v ** (1 / 2.2) for v in color))
+                for line in motion_node.posed_root_mark(node, frame, rig.pose_from_geometry(rig_geo)) or ():
+                    geo.createPolygons([tuple(geo.createPoints(line))], False)
+                self._mark_lines.setGeometry(geo)
+            self._mark_lines.setTransform(skel.drawable.transform())
+            self._mark_lines.draw(draw_handle)
+
         def onDraw(self, kwargs):
             super().onDraw(kwargs)
             self._draw_own(kwargs)
@@ -251,6 +284,7 @@ def _state_class():
                 return
             current = int(round(hou.frame())) - 1
             self._draw_pose(kwargs["draw_handle"], current)
+            self._draw_mark(kwargs["draw_handle"], current)
             try:
                 from kimodo_motion import motion_node
 
@@ -306,8 +340,9 @@ def _state_class():
                 pass
 
         def onExit(self, kwargs):
-            if self._pose_lines is not None:
-                self._pose_lines.show(False)
+            for lines in (self._pose_lines, self._mark_lines):
+                if lines is not None:
+                    lines.show(False)
             for drawable in (self._label_text, self._label_boxes):
                 if drawable is not None:
                     drawable.show(False)
@@ -353,6 +388,14 @@ def _state_class():
                 params={"use_cd": True, "line_width": 2.0},
             )
             self._pose_lines.show(True)
+            self._mark_lines = hou.GeometryDrawable(
+                self.scene_viewer,
+                hou.drawableGeometryType.Line,
+                "kimodo_root_mark",
+                params={"use_cd": True, "line_width": 2.0},
+            )
+            self._mark_lines.show(True)
+            self._mark_key = None
             self._pose_key = None
             self._title = STATE_LABEL
             self._label_boxes = hou.GeometryDrawable(

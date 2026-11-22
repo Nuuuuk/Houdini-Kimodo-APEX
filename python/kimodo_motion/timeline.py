@@ -144,3 +144,53 @@ def delete_run(d, cid, run):
     c["frames"] = [f for f in c["frames"] if f not in set(run)]
     if not c["frames"]:
         d["constraints"].remove(c)
+
+
+def split_runs(d, runs_):
+    """each run gets a constraint of its own"""
+    ids = []
+    for cid, run in runs_:
+        c = _find(d, "constraints", cid)
+        if set(c["frames"]) <= set(run):
+            ids.append(cid)
+            continue
+        c["frames"] = [f for f in c["frames"] if f not in set(run)]
+        part = {**c, "id": _new_id(d, "constraints", "c"), "frames": sorted(run)}
+        d["constraints"].append(part)
+        ids.append(part["id"])
+    return ids
+
+
+def change_runs(d, runs_, ctype):
+    """runs to another type, runs of that type stay"""
+    runs_ = [(cid, run) for cid, run in runs_ if _find(d, "constraints", cid)["type"] != ctype]
+    frames = {f for _, run in runs_ for f in run}
+    replaced = sorted(frames & _taken(d, ctype))
+    for cid in split_runs(d, runs_):
+        c = _find(d, "constraints", cid)
+        c["type"] = "changing"
+        c.pop("auto", None)
+        c.pop("heading", None)
+    for c in d["constraints"]:
+        if c["type"] == ctype:
+            c["frames"] = [f for f in c["frames"] if f not in frames]
+        elif c["type"] == "changing":
+            c["type"] = ctype
+    d["constraints"] = [c for c in d["constraints"] if c["frames"]]
+    return replaced
+
+
+def heading_runs(d, runs_, on):
+    """2d root heading on or off for these runs"""
+    runs_ = [
+        (cid, run)
+        for cid, run in runs_
+        if _find(d, "constraints", cid)["type"] == "root2d" and bool(_find(d, "constraints", cid).get("heading")) != on
+    ]
+    for cid in split_runs(d, runs_):
+        c = _find(d, "constraints", cid)
+        if on:
+            c["heading"] = True
+        else:
+            c.pop("heading", None)
+    return runs_

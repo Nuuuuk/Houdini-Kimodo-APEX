@@ -281,13 +281,23 @@ def _hip_line(rotation):
     return None if length < 1e-9 else np.array([line[0], line[2]]) / length
 
 
-def with_heading(rotation, like):
-    """rotation turned about y to the heading of like"""
-    mine, wanted = _hip_line(rotation), _hip_line(like)
+def _turned(rotation, wanted):
+    mine = _hip_line(rotation)
     if mine is None or wanted is None:
         return np.array(rotation, dtype=np.float64)
     c, s = wanted[0] * mine[0] + wanted[1] * mine[1], wanted[0] * mine[1] - wanted[1] * mine[0]
     return np.array([[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]]) @ rotation
+
+
+def with_heading(rotation, like):
+    """rotation turned about y to the heading of like"""
+    return _turned(rotation, _hip_line(like))
+
+
+def facing(rotation, heading):
+    """rotation turned about y to a kimodo heading (cos, sin)"""
+    line = np.array([-heading[0], heading[1]], dtype=np.float64)
+    return _turned(rotation, line / np.linalg.norm(line))
 
 
 def pinned_pose(base_local, stored_local, stored_root, tips):
@@ -365,7 +375,12 @@ def solve_limb(world, positions, upper, mid, tip):
 TIPS = {"left-hand": "LeftHand", "right-hand": "RightHand", "left-foot": "LeftFoot", "right-foot": "RightFoot"}
 
 
-def composed_pose(base_local, base_root, stored_local, stored_root, stored_root_2d, ctypes):
+def root_turn(base_local, heading):
+    """turn about y that brings a base pose to heading"""
+    return facing(base_local[0], heading) @ np.asarray(base_local[0], dtype=np.float64).T
+
+
+def composed_pose(base_local, base_root, stored_local, stored_root, stored_root_2d, ctypes, heading=None):
     """the pose the rig follows on a frame with a stored pose"""
     if stored_local is not None and ("fullbody" in ctypes or not ctypes):
         return fk(stored_local, stored_root)
@@ -376,10 +391,13 @@ def composed_pose(base_local, base_root, stored_local, stored_root, stored_root_
     root = np.array(base_root, dtype=np.float64)
     if not (np.isnan(x) or np.isnan(z)):
         root[0], root[2] = x, z
-    return fk(base_local, root)
+    local = np.array(base_local, dtype=np.float64)
+    if heading is not None:
+        local[0] = facing(local[0], heading)
+    return fk(local, root)
 
 
-def write_geometry(geo, positions, transform, with_root=False, tags=None, names=JOINT_NAMES):
+def write_geometry(geo, positions, transform, with_root=False, tags=None, names=JOINT_NAMES, root_rotation=None):
     """kinefx skeleton from joint positions and transforms"""
     import hou
 
@@ -391,7 +409,8 @@ def write_geometry(geo, positions, transform, with_root=False, tags=None, names=
     if with_root:
         names.append(ROOT)
         positions = np.vstack([positions, [positions[0, 0], 0.0, positions[0, 2]]])
-        transform = np.vstack([transform, np.eye(3).reshape(1, 9)])
+        turn = np.eye(3) if root_rotation is None else np.asarray(root_rotation, dtype=np.float64).T
+        transform = np.vstack([transform, turn.reshape(1, 9)])
     geo.addAttrib(hou.attribType.Point, "name", "")
     geo.addAttrib(hou.attribType.Point, "transform", (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0))
     points = geo.createPoints([tuple(p) for p in positions.tolist()])

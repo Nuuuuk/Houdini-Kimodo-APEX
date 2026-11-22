@@ -64,6 +64,20 @@ def heading_of(pose):
     return float(np.cos(angle)), float(np.sin(angle))
 
 
+def first_heading_angle(cjson):
+    """heading the constraints hold on the first frame"""
+    for e in cjson:
+        if e["type"] == "root2d" and "global_root_heading" in e and 0 in e["frame_indices"]:
+            c, s = e["global_root_heading"][e["frame_indices"].index(0)]
+            return float(np.arctan2(s, c))
+    for e in cjson:
+        if e["type"] == "fullbody" and 0 in e["frame_indices"]:
+            i = e["frame_indices"].index(0)
+            c, s = heading_of(Pose(axis_angle_to_matrix(np.array(e["local_joints_rot"][i])), np.array(e["root_positions"][i])))
+            return float(np.arctan2(s, c))
+    return None
+
+
 def same_pose(a, b, position_tol=1e-4, angle_tol=1e-3):
     (pa, wa), (pb, wb) = fk(a.local_rots, a.root_position), fk(b.local_rots, b.root_position)
     if np.abs(pa - pb).max() > position_tol:

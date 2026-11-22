@@ -101,7 +101,7 @@ def apply(cjson):
 
 def guide(cjson):
     """what to draw in the viewport for the root2d entries"""
-    lines, headings = [], []
+    lines = []
     for e in cjson:
         if e["type"] != "root2d":
             continue
@@ -112,5 +112,4 @@ def guide(cjson):
                 if i - start > 1:
                     lines.append([list(p) for p in xz[start:i]])
                 start = i
-        headings += [[p[0], p[1], h[0], h[1]] for p, h in zip(xz, e.get("global_root_heading", []))]
-    return {"lines": lines, "headings": headings}
+    return {"lines": lines}

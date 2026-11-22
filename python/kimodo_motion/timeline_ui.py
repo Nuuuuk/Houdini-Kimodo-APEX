@@ -47,13 +47,13 @@ class Canvas(panel_parts.TimelineCanvas):
     runs_move_requested = QtCore.Signal(object, int)
     selection_ended = QtCore.Signal()
     reset_requested = QtCore.Signal(object)
-    run_delete_requested = QtCore.Signal(str, object)
     runs_delete_requested = QtCore.Signal(object)
     markers_copy_requested = QtCore.Signal(object, bool)
     markers_cut_requested = QtCore.Signal(object)
     markers_paste_requested = QtCore.Signal(int)
     range_requested = QtCore.Signal(str, int, int)
-    heading_requested = QtCore.Signal(str, bool)
+    runs_type_requested = QtCore.Signal(object, str)
+    heading_requested = QtCore.Signal(object, bool)
     play_requested = QtCore.Signal()
     step_requested = QtCore.Signal(int)
     hint_changed = QtCore.Signal(str)
@@ -333,40 +333,65 @@ class Canvas(panel_parts.TimelineCanvas):
             elif pr["id"] != self.selected:
                 self.prompt_select_requested.emit(pr["id"])
 
+    def marker_menu(self, event, c, run, ctype):
+        selected = c is not None and self.is_marked(c, run)
+        targets = self.marked_runs() if selected else [(c, run)] if c is not None else []
+        ids = [(m["id"], r) for m, r in targets]
+        menu, actions = QtWidgets.QMenu(self), {}
+
+        def add(text, call, enabled=True, checked=None):
+            action = menu.addAction(text)
+            action.setEnabled(enabled)
+            if checked is not None:
+                action.setCheckable(True)
+                action.setChecked(checked)
+            actions[action] = call
+
+        if selected:
+            add("Copy Selected Poses", lambda: self.markers_copy_requested.emit(ids, False))
+        elif c is not None:
+            x = event.position().x() / self.scale() - 0.5
+            frame = min(run, key=lambda f: abs(f - x))
+            add("Copy Pose", lambda: (self.copy_requested.emit(frame), self.markers_copy_requested.emit(ids, True)))
+        for text, keep_root in panel_parts.paste_entries(ctype, self.frame):
+            add(
+                text,
+                lambda keep_root=keep_root: self.paste_requested.emit(ctype, keep_root),
+                motion_node.has_copied_pose(),
+            )
+        if c is not None:
+            menu.addSeparator()
+            add("Delete Selected" if selected else "Delete", lambda: self.runs_delete_requested.emit(ids))
+            add(
+                "Reset Selected" if selected else "Reset Constraint",
+                lambda: self.reset_requested.emit(ids),
+                self.can_reset(targets),
+            )
+            menu.addSeparator()
+            for i, t in enumerate(panel_parts.TRACK_TYPES):
+                if any(m["type"] != t for m, _ in targets):
+                    name = panel_parts.TRACKS[i + 1]
+                    add(
+                        f"Change Selected to {name}" if selected else f"Change to {name}",
+                        lambda t=t: self.runs_type_requested.emit(ids, t),
+                    )
+            if ctype == "root2d":
+                roots = [(m, r) for m, r in targets if m["type"] == "root2d"]
+                held = all(m.get("heading") for m, _ in roots)
+                menu.addSeparator()
+                add(
+                    "Constrain Selected Headings" if selected else "Constrain Heading",
+                    lambda: self.heading_requested.emit([(m["id"], r) for m, r in roots], not held),
+                    checked=held,
+                )
+        chosen = menu.exec(event.globalPosition().toPoint())
+        if chosen in actions:
+            actions[chosen]()
+
     def press_track(self, event, pos, ctype):
         c, run = self.run_at(pos)
         if event.button() == QtCore.Qt.RightButton:
-            x = pos.x() / self.scale() - 0.5
-            menu, actions = self.track_menu(c, ctype, min(run, key=lambda f: abs(f - x)) if c is not None else None)
-            for action in menu.actions():
-                if action.text() == "Copy Pose" and c is not None and self.is_marked(c, run):
-                    action.setText("Copy Selected Poses")
-                    actions[action] = lambda: self.markers_copy_requested.emit(
-                        [(m["id"], r) for m, r in self.marked_runs()], False
-                    )
-                elif action.text() == "Copy Pose" and c is not None:
-                    copy_one = actions[action]
-                    actions[action] = lambda copy_one=copy_one: (
-                        copy_one(),
-                        self.markers_copy_requested.emit([(c["id"], run)], True),
-                    )
-            for i, action in enumerate(menu.actions()):
-                if action.text() == "Delete":
-                    actions[action] = lambda: self.run_delete_requested.emit(c["id"], run)
-                    reset = QtGui.QAction("Reset Constraint", menu)
-                    reset.setEnabled(self.can_reset([(c, run)]))
-                    menu.insertAction(menu.actions()[i + 1] if i + 1 < len(menu.actions()) else None, reset)
-                    actions[reset] = lambda: self.reset_requested.emit([(c["id"], run)])
-                    break
-            if ctype == "root2d" and c is not None:
-                menu.addSeparator()
-                heading = menu.addAction("Constrain Heading")
-                heading.setCheckable(True)
-                heading.setChecked(bool(c.get("heading")))
-                actions[heading] = lambda: self.heading_requested.emit(c["id"], not c.get("heading"))
-            chosen = menu.exec(event.globalPosition().toPoint())
-            if chosen in actions:
-                actions[chosen]()
+            self.marker_menu(event, c, run, ctype)
         elif event.button() == QtCore.Qt.LeftButton:
             frame = self.frame_at(pos.x())
             shift = bool(event.modifiers() & QtCore.Qt.ShiftModifier)
@@ -684,13 +709,13 @@ class Panel(panel_parts.KimodoPanel):
         canvas.runs_move_requested.connect(self.move_runs)
         canvas.selection_ended.connect(self.refresh)
         canvas.reset_requested.connect(lambda runs: self.edit(timeline_edit.reset_runs, runs))
-        canvas.run_delete_requested.connect(lambda cid, run: self.edit(timeline_edit.delete_run, cid, run))
         canvas.runs_delete_requested.connect(lambda runs: self.edit(timeline_edit.delete_runs, runs))
         canvas.markers_copy_requested.connect(lambda runs, quiet: self.edit(timeline_edit.copy_runs, runs, quiet))
         canvas.markers_cut_requested.connect(lambda runs: self.edit(timeline_edit.cut_runs, runs))
         canvas.markers_paste_requested.connect(self.paste_markers)
         canvas.range_requested.connect(lambda ctype, a, b: self.edit(timeline_edit.add_range, ctype, a, b))
-        canvas.heading_requested.connect(lambda cid, on: self.edit(timeline_edit.set_heading, cid, on))
+        canvas.heading_requested.connect(lambda runs, on: self.edit(timeline_edit.set_heading, runs, on))
+        canvas.runs_type_requested.connect(lambda runs, ctype: self.edit(timeline_edit.change_runs, runs, ctype))
         canvas.hint_changed.connect(self.show_hover_hint)
         canvas.play_requested.connect(self.toggle_play)
         canvas.step_requested.connect(lambda step: hou.setFrame(max(int(round(hou.frame())) + step, 1)))

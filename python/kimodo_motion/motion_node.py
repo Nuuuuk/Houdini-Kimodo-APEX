@@ -164,6 +164,7 @@ def doc_from_parms(node):
 _raw_cache = {}
 _poses_cache = {}
 _types_cache = {}
+_headed_cache = {}
 _pose_of = {}
 _was_auto = {}
 _made = {}
@@ -230,6 +231,9 @@ def _raw_poses(node):
     return _raw_cache[text]
 
 
+UNHEADED = "unheaded"
+
+
 def raw_pose(pose):
     raw = {
         "rot": None if pose.local_rots is None else constraints.matrix_to_axis_angle(pose.local_rots).tolist(),
@@ -281,6 +285,24 @@ def types_at(d):
         for frame in c["frames"]:
             found.setdefault(frame, set()).add(c["type"])
     return found
+
+
+def _headed(node):
+    """2d root frames that hold the heading too"""
+    text = node.parm("kimodo_doc").unexpandedString()
+    if text not in _headed_cache:
+        _headed_cache.clear()
+        _headed_cache[text] = {
+            f for c in doc.loads(text)["constraints"] if c["type"] == "root2d" and c.get("heading") for f in c["frames"]
+        }
+    return _headed_cache[text]
+
+
+def held_heading(node, frame, pose):
+    """(cos, sin) a 2d root keyframe with constrain heading holds"""
+    if frame not in _headed(node) or (pose.local_rots is None and pose.heading is None):
+        return None
+    return constraints.heading_of(pose)
 
 
 def _types(node):
@@ -486,14 +508,18 @@ def sync_poses(node):
                 seen[keys] = raw[frame]
             else:
                 pose = rig.pose(node, frame)
+                if types.get(frame) and types[frame] <= {"root2d"}:
+                    pose = _sent_of_2d_root(node, frame, pose)
                 seen[keys] = raw_pose(constraints.Pose(pose.local_rots, pose.root_position, pose.root_2d))
+                if UNHEADED in raw.get(frame, {}):
+                    seen[keys][UNHEADED] = raw[frame][UNHEADED]
         raw[frame] = seen[keys]
         ctypes = types.get(frame, set())
         if (
             undone is None
             and posed[frame]
+            and ctypes
             and "fullbody" not in ctypes
-            and ctypes & set(skeleton.TIPS)
             and every[:, frame].tobytes() != on_pose.get(frame)
         ):
             renew.append(frame)
@@ -534,10 +560,6 @@ def _own_step():
     _undo_seen.clear()
     _undo_event.clear()
     _noticed.clear()
-
-
-def _at(frames):
-    return f"at frame {frames[0] + 1}" if len(frames) == 1 else f"at frames {frames[0] + 1} to {frames[-1] + 1}"
 
 
 def _write_constraints(node, d, raw, label, renew=()):
@@ -618,52 +640,6 @@ def add_constraint(node, ctype, frame, auto=False):
     update_unapplied(node)
     set_status(node, f"{TYPE_LABELS[ctype]} keyframe added at frame {frame + 1}.")
     return entry["id"]
-
-
-def delete_constraint(node, cid):
-    _flush(node)
-    sync_poses(node)
-    before = read_doc(node)
-    gone = [c for c in before["constraints"] if c["id"] == cid]
-    if not gone:
-        return
-    d = dict(before, constraints=[c for c in before["constraints"] if c["id"] != cid])
-    was, now = types_at(before), types_at(d)
-    raw = {frame: pose for frame, pose in _raw_poses(node).items() if frame in now}
-    renew = [f for f in gone[0]["frames"] if f not in now or _taken(now[f]) != _taken(was[f])]
-    _write_constraints(
-        node, d, raw, f"{OWN_UNDO}delete {TYPE_LABELS[gone[0]['type']]} constraint {_at(gone[0]['frames'])}", renew
-    )
-    update_unapplied(node)
-    set_status(node, f"{TYPE_LABELS[gone[0]['type']]} constraint deleted.")
-
-
-def set_constraint_type(node, cid, ctype):
-    _flush(node)
-    sync_poses(node)
-    before = read_doc(node)
-    d = json.loads(json.dumps(before))
-    frames = []
-    for c in d["constraints"]:
-        if c["id"] == cid:
-            c["type"] = ctype
-            c.pop("auto", None)
-            frames = c["frames"]
-    was, now = types_at(before), types_at(d)
-    raw = dict(_raw_poses(node))
-    for frame in frames:
-        raw.setdefault(frame, raw_pose(base_pose(node, frame)))
-    _write_constraints(
-        node,
-        d,
-        raw,
-        f"{OWN_UNDO}change constraint {_at(frames)} to {TYPE_LABELS[ctype]}"
-        if frames
-        else f"{OWN_UNDO}change constraint",
-        [f for f in frames if _taken(now[f]) != _taken(was[f])],
-    )
-    update_unapplied(node)
-    set_status(node, f"Constraint set to {TYPE_LABELS[ctype]}.")
 
 
 _copied = {}
@@ -1582,6 +1558,7 @@ REST_COLOR = (0.33, 0.33, 0.33)
 MAX_POSES = 40
 RUN_STEP = 10
 CROSS = 0.12
+ARROW, ARROW_HEAD = 0.6, 0.06
 POSE_FRAME = "pose_frame"
 _labels = {}
 
@@ -1626,7 +1603,13 @@ def posed_positions(node, frame, rig_pose):
     """joint positions of a frame's pose as stored when the rig has rig_pose"""
     local, root = _frame_pose(shown_motion(node), frame)
     return skeleton.composed_pose(
-        local, root, rig_pose.local_rots, rig_pose.root_position, rig_pose.root_2d, _types(node).get(frame, set())
+        local,
+        root,
+        rig_pose.local_rots,
+        rig_pose.root_position,
+        rig_pose.root_2d,
+        _types(node).get(frame, set()),
+        held_heading(node, frame, rig_pose),
     )[0]
 
 
@@ -1664,6 +1647,31 @@ def _pose_root(stored, frame):
     return None if np.isnan(x) or np.isnan(z) else (float(x), 0.0, float(z))
 
 
+def root_mark(x, z, heading, cross=True):
+    """lines of a 2d root keyframe's cross on the ground"""
+    c, s = (1.0, 0.0) if heading is None else heading
+
+    def at(ahead, aside):
+        return (x + ahead * s + aside * c, 0.0, z + ahead * c - aside * s)
+
+    lines = [[at(0.0, -CROSS), at(0.0, CROSS)]] if cross else []
+    if heading is None:
+        return lines + [[at(-CROSS, 0.0), at(CROSS, 0.0)]]
+    tip = at(ARROW, 0.0)
+    head = [[tip, at(ARROW - ARROW_HEAD * 0.866, side * ARROW_HEAD * 0.5)] for side in (-1.0, 1.0)]
+    return lines + [[at(-CROSS if cross else 0.0, 0.0), tip]] + head
+
+
+def posed_root_mark(node, frame, pose):
+    """root_mark from the rig's pose instead of the stored one"""
+    held = held_heading(node, frame, pose)
+    if held is None:
+        return None
+    frames = next(c["frames"] for c in read_doc(node)["constraints"] if c["type"] == "root2d" and frame in c["frames"])
+    x, z = pose.root_2d if pose.root_2d is not None else pose.root_position[[0, 2]]
+    return root_mark(float(x), float(z), held, cross=frame - 1 not in frames and frame + 1 not in frames)
+
+
 def cook_poses(sop):
     """python sop: the pose of every constraint keyframe"""
     node, geo = sop.parent(), sop.geometry()
@@ -1698,17 +1706,18 @@ def cook_poses(sop):
             if not path:
                 continue
             first = len(points)
-            if len(path) == 1:
-                x, _, z = path[0][1]
-                points += [(x - CROSS, 0.0, z), (x + CROSS, 0.0, z), (x, 0.0, z - CROSS), (x, 0.0, z + CROSS)]
-                colors += [color(path[0][0])] * 4
-                frames += [path[0][0]] * 4
-                lines += [(first, first + 1), (first + 2, first + 3)]
-            else:
+            if len(path) > 1:
                 points += [p for _, p in path]
                 colors += [color(frame) for frame, _ in path]
                 frames += [-1] * len(path)
                 lines += [tuple(range(first, first + len(path)))]
+            for frame, (x, _, z) in path if len(path) == 1 or c.get("heading") else ():
+                held = held_heading(node, frame, stored[frame]) if c.get("heading") else None
+                for line in root_mark(x, z, held, cross=len(path) == 1):
+                    lines.append(tuple(range(len(points), len(points) + len(line))))
+                    points += line
+                    colors += [color(frame)] * len(line)
+                    frames += [frame] * len(line)
     if points:
         made = geo.createPoints(points)
         geo.setPointFloatAttribValues("Cd", [v for c in colors for v in c])
@@ -1794,10 +1803,32 @@ def _rig_motion(node):
     return kept[1]
 
 
-def _write_pose(geo, positions, world, with_root):
+def _write_pose(geo, positions, world, with_root, root_rotation=None):
     skeleton.write_geometry(
-        geo, positions, np.swapaxes(world, -1, -2).reshape(skeleton.NUM_JOINTS, 9), with_root=with_root
+        geo,
+        positions,
+        np.swapaxes(world, -1, -2).reshape(skeleton.NUM_JOINTS, 9),
+        with_root=with_root,
+        root_rotation=root_rotation,
     )
+
+
+def _sent_of_2d_root(node, frame, pose):
+    local, root = _frame_pose(_rig_motion(node), frame)
+    held = held_heading(node, frame, pose)
+    local = np.array(local, dtype=np.float64)
+    if held is not None:
+        local[0] = skeleton.facing(local[0], held)
+    x, z = (pose.root_position[0], pose.root_position[2]) if pose.root_2d is None else pose.root_2d
+    root = np.array(root, dtype=np.float64)
+    root[0], root[2] = x, z
+    return constraints.Pose(local, root, pose.root_2d)
+
+
+def _held_turn(node, motion, frame):
+    types, stored = _types(node).get(frame, set()), read_poses(node).get(frame)
+    held = held_heading(node, frame, stored) if stored is not None and types and types <= {"root2d"} else None
+    return None if held is None else skeleton.root_turn(_frame_pose(motion, frame)[0], held)
 
 
 def _composed(node, motion, frame):
@@ -1806,7 +1837,9 @@ def _composed(node, motion, frame):
     if stored is None or not types:
         return _motion_pose(motion, frame)
     local, root = _frame_pose(motion, frame)
-    return skeleton.composed_pose(local, root, stored.local_rots, stored.root_position, stored.root_2d, types)
+    return skeleton.composed_pose(
+        local, root, stored.local_rots, stored.root_position, stored.root_2d, types, held_heading(node, frame, stored)
+    )
 
 
 def cook_rig_source(sop):
@@ -1817,5 +1850,6 @@ def cook_rig_source(sop):
 
 def cook_pose_source(sop):
     """python sop: the same motion with the stored poses on their frames"""
-    node = sop.parent()
-    _write_pose(sop.geometry(), *_composed(node, _rig_motion(node), int(round(hou.frame())) - 1), True)
+    node, frame = sop.parent(), int(round(hou.frame())) - 1
+    motion = _rig_motion(node)
+    _write_pose(sop.geometry(), *_composed(node, motion, frame), True, _held_turn(node, motion, frame))

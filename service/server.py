@@ -15,7 +15,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 SERVICE_NAME = "kimodo_motion"
-SERVICE_VERSION = 1
+SERVICE_VERSION = 2
 DEFAULT_MODEL = "Kimodo-SOMA-RP-v1.2"
 MODELS = ("Kimodo-SOMA-RP-v1.2", "Kimodo-SOMA-RP-v1.1", "Kimodo-SOMA-RP-v1")
 NUM_TRANSITION_FRAMES = 5
@@ -65,6 +65,7 @@ def parse_request(body):
         "num_samples": body.get("num_samples", 1),
         "postprocess": bool(body.get("postprocess", True)),
         "root_margin": body.get("root_margin"),
+        "first_heading_angle": body.get("first_heading_angle"),
         "output_dir": out_dir,
         "bvh": bool(body.get("bvh", False)),
     }
@@ -72,6 +73,10 @@ def parse_request(body):
     need(isinstance(req["steps"], int) and req["steps"] > 0, "steps must be a positive integer")
     need(isinstance(req["num_samples"], int) and req["num_samples"] > 0, "num_samples must be a positive integer")
     need(req["root_margin"] is None or isinstance(req["root_margin"], (int, float)), "root_margin must be a number")
+    need(
+        req["first_heading_angle"] is None or isinstance(req["first_heading_angle"], (int, float)),
+        "first_heading_angle must be a number",
+    )
     req["text_encoder_device"] = body.get("text_encoder_device")
     need(req["text_encoder_device"] in (None, "cuda", "cpu"), "text_encoder_device must be cuda or cpu")
     return req
@@ -294,6 +299,8 @@ class Service:
         kwargs = {}
         if req["root_margin"] is not None:
             kwargs["root_margin"] = float(req["root_margin"])
+        if req["first_heading_angle"] is not None:
+            kwargs["first_heading_angle"] = float(req["first_heading_angle"])
         generate_inner = model._generate
         model._generate = lambda *a, **kw: generate_inner(*a, **{"progress_bar": progress, **kw})
         try:

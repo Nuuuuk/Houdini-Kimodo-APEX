@@ -323,21 +323,59 @@ def paste_runs(node, frame):
     return pasted
 
 
-def set_heading(node, cid, on):
+def set_heading(node, runs, on):
     """constrain heading on or off for 2d root markers"""
     d = current_doc(node)
-    c = next(c for c in d["constraints"] if c["id"] == cid)
-    if on:
-        c["heading"] = True
-    else:
-        c.pop("heading", None)
-    with hou.undos.group(motion_node.OWN_UNDO + ("constrain 2D Root heading" if on else "free 2D Root heading")):
-        motion_node.write_doc(node, d)
-    motion_node._own_step()
-    motion_node.update_unapplied(node)
-    motion_node.set_status(
-        node, "2D Root constraint: heading constrained too." if on else "2D Root constraint: position only."
+    runs = timeline.heading_runs(d, [(cid, list(run)) for cid, run in runs], on)
+    frames = sorted({f for _, run in runs for f in run})
+    if not frames:
+        return False
+    raw = dict(motion_node._raw_poses(node))
+    for f in frames:
+        pose = raw.get(f)
+        if pose is None:
+            continue
+        if on:
+            raw[f] = {**pose, motion_node.UNHEADED: {k: v for k, v in pose.items() if k != motion_node.UNHEADED}}
+        else:
+            before = pose.get(motion_node.UNHEADED) or {"rot": None}
+            raw[f] = {k: v for k, v in before.items() if k not in ("root", "root2d")}
+            raw[f]["root"] = pose["root"] if before.get("rot") is not None else [pose["root"][0], None, pose["root"][2]]
+            if "root2d" in pose:
+                raw[f]["root2d"] = pose["root2d"]
+    what = "2D Root heading" if len(runs) == 1 else f"{len(runs)} 2D Root headings"
+    motion_node._write_constraints(
+        node, d, raw, motion_node.OWN_UNDO + ("constrain " if on else "free ") + what, frames
     )
+    motion_node.update_unapplied(node)
+    who = "2D Root constraint" if len(runs) == 1 else f"{len(runs)} 2D Root markers"
+    motion_node.set_status(node, f"{who}: heading constrained too." if on else f"{who}: position only.")
+    return True
+
+
+def change_runs(node, runs, ctype):
+    _settle(node)
+    before = current_doc(node)
+    after = copy.deepcopy(before)
+    runs = [(cid, list(run)) for cid, run in runs]
+    changing = [
+        (cid, run) for cid, run in runs if next(c for c in before["constraints"] if c["id"] == cid)["type"] != ctype
+    ]
+    replaced = timeline.change_runs(after, changing, ctype)
+    if not changing:
+        return False
+    new = motion_node.TYPE_LABELS[ctype]
+    if len(changing) == 1:
+        old = motion_node.TYPE_LABELS[next(c for c in before["constraints"] if c["id"] == changing[0][0])["type"]]
+        where = _span_text(changing[0][1])
+        label, text = f"change {old} constraint on {where} to {new}", f"{old} constraint on {where} changed to {new}."
+    else:
+        label, text = f"change {len(changing)} markers to {new}", f"{len(changing)} markers changed to {new}."
+    _write_constraints(node, before, after, {}, label)
+    if replaced:
+        text += f" It replaced the {new} {'constraint' if len(replaced) == 1 else 'constraints'} on {_frames_text(replaced)}."
+    motion_node.set_status(node, text)
+    return True
 
 
 def set_smooth_path(node):
@@ -361,7 +399,6 @@ def set_smooth_path(node):
 
 
 GUIDE_HEIGHT = 0.005
-TICK = 0.25
 
 
 def update_root_path_guide(node):
@@ -395,7 +432,3 @@ def cook_root_path(sop):
 
     for line in shapes["lines"]:
         polyline(line)
-    if not sop.parent().evalParm("show_poses"):
-        return
-    for x, z, c, s in shapes["headings"]:
-        polyline([(x, z), (x + TICK * s, z + TICK * c)])
