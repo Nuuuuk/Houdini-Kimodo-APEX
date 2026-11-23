@@ -37,13 +37,16 @@ def _write_prompts(node, d, label, selected=None):
         i = motion_node.selected_prompt(node, old)
         selected = old["prompts"][i]["id"] if old["prompts"][i]["id"] in ids else ids[min(i, len(ids) - 1)]
     index = ids.index(selected)
+    timeline.keep_path_ends(d, bool(node.evalParm("smooth_root_path")))
+    used, old = set(motion_node.constraint_frames(d)), motion_node._raw_poses(node)
+    raw = {f: p for f, p in old.items() if f in used}
+    raw.update({f: motion_node.raw_pose(motion_node.base_pose(node, f)) for f in used if f not in raw})
     with hou.undos.group(motion_node.OWN_UNDO + label):
         motion_node.write_doc(node, d)
         if node.evalParm("selected_prompt") != index:
             node.parm("selected_prompt").set(index)
-        raw = motion_node._raw_poses(node)
-        if any(f >= total for f in raw):
-            motion_node.write_raw_poses(node, {f: p for f, p in raw.items() if f < total}, record=True)
+        if raw != old:
+            motion_node.write_raw_poses(node, raw, record=True)
     motion_node._own_step()
     motion_node.update_unapplied(node)
 
@@ -96,6 +99,7 @@ def delete_prompt(node, pid):
 
 
 def _write_constraints(node, before, after, mapping, label, poses=None):
+    timeline.keep_path_ends(after, bool(node.evalParm("smooth_root_path")))
     was, now = motion_node.types_at(before), motion_node.types_at(after)
     old = motion_node._raw_poses(node)
     raw = {f: p for f, p in old.items() if f in now}
@@ -120,7 +124,26 @@ def _span_text(frames):
 
 
 def _frames_text(frames):
-    return f"frame {frames[0] + 1}" if len(frames) == 1 else f"frames {', '.join(str(f + 1) for f in frames)}"
+    if len(frames) == 1:
+        return f"frame {frames[0] + 1}"
+    if len(frames) > 6:
+        return f"{len(frames)} frames ({frames[0] + 1} to {frames[-1] + 1})"
+    return f"frames {', '.join(str(f + 1) for f in frames)}"
+
+
+def _replaced_text(same_type=(), poses=()):
+    """what an edit replaced where its markers landed"""
+    text = ""
+    if same_type:
+        what = " and ".join(motion_node.TYPE_LABELS[t] for t in sorted({t for t, _ in same_type}))
+        frames = sorted({f for _, f in same_type})
+        text += (
+            f" It replaced the {what} {'constraint' if len(frames) == 1 else 'constraints'} on {_frames_text(frames)}."
+        )
+    if poses:
+        frames = sorted(poses)
+        text += f" Its pose replaced the one already on {_frames_text(frames)}."
+    return text
 
 
 def move_runs(node, runs, delta):
@@ -151,20 +174,7 @@ def move_runs(node, runs, delta):
         label = f"move {len(runs)} markers by {delta:+d} frames"
         text = f"{len(runs)} markers moved by {delta:+d} frames."
     _write_constraints(node, before, after, mapping, label)
-    if len(replaced) == 1:
-        text += (
-            f" {'Its pose' if len(runs) == 1 else 'A moved pose'} replaced the one already on frame {replaced[0] + 1}."
-        )
-    elif replaced:
-        text += f" {'Its' if len(runs) == 1 else 'Moved'} poses replaced the ones already on {len(replaced)} frames ({replaced[0] + 1} to {replaced[-1] + 1})."
-    if same_type:
-        kinds = sorted({t for t, _ in same_type})
-        what = " and ".join(motion_node.TYPE_LABELS[t] for t in kinds)
-        frames = sorted(f for _, f in same_type)
-        text += (
-            f" It replaced the {what} {'constraint' if len(frames) == 1 else 'constraints'} on {_frames_text(frames)}."
-        )
-    motion_node.set_status(node, text)
+    motion_node.set_status(node, text + _replaced_text(same_type, replaced))
     return moved
 
 
@@ -194,14 +204,21 @@ def reset_runs(node, runs):
 def clear_all(node):
     _settle(node)
     before = current_doc(node)
-    count = len(before["constraints"])
-    if not count:
+    count = sum(not c.get(timeline.LOCKED) for c in before["constraints"])
+    smooth = bool(node.evalParm("smooth_root_path"))
+    if not count and not smooth:
         motion_node.set_status(node, "There are no constraints to clear.")
         return False
     after = copy.deepcopy(before)
     after["constraints"] = []
-    _write_constraints(node, before, after, {}, "clear all constraints")
-    motion_node.set_status(node, f"All constraints cleared ({count}).")
+    with hou.undos.group(motion_node.OWN_UNDO + "clear all constraints"):
+        if smooth:
+            node.parm("smooth_root_path").set(0)
+        _write_constraints(node, before, after, {}, "clear all constraints")
+    update_root_path_guide(node)
+    motion_node.set_status(
+        node, f"All constraints cleared ({count})." + (" Smooth 2D Root Path is off." if smooth else "")
+    )
     return True
 
 
@@ -241,13 +258,9 @@ def delete_runs(node, runs, verb="delete"):
             timeline.delete_run(after, cid, run)
     if after["constraints"] == before["constraints"]:
         return False
-    _write_constraints(node, before, after, {}, f"{verb} {_plural(len(runs), 'marker')}")
-    motion_node.set_status(node, f"{_plural(len(runs), 'marker')} {'cut' if verb == 'cut' else 'deleted'}.")
+    _write_constraints(node, before, after, {}, f"{verb} {motion_node._plural(len(runs), 'marker')}")
+    motion_node.set_status(node, f"{motion_node._plural(len(runs), 'marker')} {'cut' if verb == 'cut' else 'deleted'}.")
     return True
-
-
-def _plural(n, word):
-    return f"{n} {word}{'' if n == 1 else 's'}"
 
 
 _copied_markers = []
@@ -275,7 +288,9 @@ def copy_runs(node, runs, quiet=False):
         for c, run in found
     ]
     if not quiet:
-        motion_node.set_status(node, f"{_plural(len(found), 'marker')} copied. Ctrl+V pastes at the current frame.")
+        motion_node.set_status(
+            node, f"{motion_node._plural(len(found), 'marker')} copied. Ctrl+V pastes at the current frame."
+        )
     return len(found)
 
 
@@ -292,7 +307,7 @@ def paste_runs(node, frame):
     before = current_doc(node)
     after = copy.deepcopy(before)
     total = doc.total_frames(after)
-    poses, pasted, dropped, replaced = {}, [], 0, 0
+    poses, pasted, dropped, replaced = {}, [], 0, []
     for m in _copied_markers:
         keep = [(frame + off, pose) for off, pose in zip(m["frames"], m["poses"]) if 0 <= frame + off < total]
         dropped += len(m["frames"]) - len(keep)
@@ -301,7 +316,8 @@ def paste_runs(node, frame):
         targets = [f for f, _ in keep]
         for c in after["constraints"]:
             if c["type"] == m["type"]:
-                replaced += len(set(c["frames"]) & set(targets))
+                if not c.get(timeline.LOCKED):
+                    replaced += [(m["type"], f) for f in c["frames"] if f in targets]
                 c["frames"] = [f for f in c["frames"] if f not in targets]
         after["constraints"] = [c for c in after["constraints"] if c["frames"]]
         entry = {"id": timeline._new_id(after, "constraints", "c"), "type": m["type"], "frames": targets}
@@ -313,18 +329,24 @@ def paste_runs(node, frame):
     if not pasted:
         motion_node.set_status(node, f"Not pasted: frame {frame + 1} would put every copied marker past the end of the motion.")
         return []
-    _write_constraints(node, before, after, {}, f"paste {_plural(len(pasted), 'marker')} at frame {frame + 1}", poses)
-    text = f"{_plural(len(pasted), 'marker')} pasted at frame {frame + 1}."
-    if replaced:
-        text += f" {_plural(replaced, 'frame')} of the same type replaced."
+    _write_constraints(
+        node, before, after, {}, f"paste {motion_node._plural(len(pasted), 'marker')} at frame {frame + 1}", poses
+    )
+    ids = {cid for cid, _ in pasted}
+    landed = {f for _, frames in pasted for f in frames}
+    kept = {f for c in after["constraints"] if c["id"] not in ids for f in c["frames"]}
+    text = f"{motion_node._plural(len(pasted), 'marker')} pasted at frame {frame + 1}." + _replaced_text(
+        replaced, landed & kept
+    )
     if dropped:
-        text += f" {_plural(dropped, 'frame')} past the end of the motion dropped."
+        text += f" {motion_node._plural(dropped, 'frame')} past the end of the motion dropped."
     motion_node.set_status(node, text)
     return pasted
 
 
 def set_heading(node, runs, on):
     """constrain heading on or off for 2d root markers"""
+    _settle(node)
     d = current_doc(node)
     runs = timeline.heading_runs(d, [(cid, list(run)) for cid, run in runs], on)
     frames = sorted({f for _, run in runs for f in run})
@@ -372,9 +394,7 @@ def change_runs(node, runs, ctype):
     else:
         label, text = f"change {len(changing)} markers to {new}", f"{len(changing)} markers changed to {new}."
     _write_constraints(node, before, after, {}, label)
-    if replaced:
-        text += f" It replaced the {new} {'constraint' if len(replaced) == 1 else 'constraints'} on {_frames_text(replaced)}."
-    motion_node.set_status(node, text)
+    motion_node.set_status(node, text + _replaced_text([(ctype, f) for f in replaced]))
     return True
 
 
@@ -384,18 +404,18 @@ def set_smooth_path(node):
     _settle(node)
     before = current_doc(node)
     d = copy.deepcopy(before)
-    if on:
-        for frame in (0, doc.total_frames(d) - 1):
-            timeline.add_keyframe(d, "root2d", frame)
     _write_constraints(node, before, d, {}, "smooth 2D Root path " + ("on" if on else "off"))
     update_root_path_guide(node)
-    frames = sorted(f for c in d["constraints"] if c["type"] == "root2d" for f in c["frames"])
-    motion_node.set_status(
-        node,
-        f"Smooth path on: one 2D Root path through {len(frames)} keyframes, frames {frames[0] + 1} to {frames[-1] + 1}."
-        if on
-        else "Smooth path off: 2D Root keyframes are sent one by one.",
+    own = sorted(c["frames"][0] for c in d["constraints"] if c.get(timeline.LOCKED))
+    keyframes = sum(len(c["frames"]) for c in d["constraints"] if c["type"] == "root2d" and not c.get(timeline.LOCKED))
+    text = (
+        f"Smooth path on: one 2D Root path over the whole motion, through {motion_node._plural(keyframes, 'keyframe')}"
     )
+    if len(own) == 2:
+        text += " and its own waypoints on the first and last frame"
+    elif own:
+        text += f" and its own waypoint on the {'first' if own[0] == 0 else 'last'} frame"
+    motion_node.set_status(node, text + "." if on else "Smooth path off: 2D Root keyframes are sent one by one.")
 
 
 GUIDE_HEIGHT = 0.005
@@ -404,11 +424,9 @@ GUIDE_HEIGHT = 0.005
 def update_root_path_guide(node):
     """store what the viewport draws for the smooth path"""
     parm = node.parm("root_path_guide")
-    if parm is None:
-        return
     d = motion_node.read_doc(node)
     text = ""
-    if any(c["type"] == "root2d" for c in d["constraints"]):
+    if node.evalParm("smooth_root_path") and any(c["type"] == "root2d" for c in d["constraints"]):
         text = json.dumps(rootpath.guide(motion_node.constraints_json(node, d)))
     if parm.unexpandedString() != text:
         with hou.undos.disabler():
@@ -417,8 +435,7 @@ def update_root_path_guide(node):
 
 def cook_root_path(sop):
     """python sop: the smooth 2d root path on the ground"""
-    parm = sop.parent().parm("root_path_guide")
-    text = parm.unexpandedString() if parm is not None else ""
+    text = sop.parent().parm("root_path_guide").unexpandedString()
     if not text.strip():
         return
     shapes, geo = json.loads(text), sop.geometry()

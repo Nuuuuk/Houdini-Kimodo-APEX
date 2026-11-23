@@ -4,6 +4,7 @@ from . import doc
 
 NEW_PROMPT_TEXT = "A person walks forward."
 NEW_PROMPT_FRAMES = 5 * doc.FPS
+LOCKED = "locked"
 
 
 def runs(frames):
@@ -80,8 +81,34 @@ def delete_prompt(d, pid):
     return _layout(d, _lengths(d))
 
 
-def _taken(d, ctype, skip=()):
-    return {f for c in d["constraints"] if c["type"] == ctype for f in c["frames"] if (c["id"], f) not in skip}
+def _taken(d, ctype, skip=(), markers=False):
+    return {
+        f
+        for c in d["constraints"]
+        if c["type"] == ctype and not (markers and c.get(LOCKED))
+        for f in c["frames"]
+        if (c["id"], f) not in skip
+    }
+
+
+def keep_path_ends(d, on):
+    """the waypoints smooth path keeps, like the demo"""
+    ends = {0, doc.total_frames(d) - 1} if on else set()
+    own = _taken(d, "root2d", markers=True)
+    before = [(c["id"], list(c["frames"])) for c in d["constraints"]]
+    kept, have = [], set(own)
+    for c in d["constraints"]:
+        if c.get(LOCKED):
+            c["frames"] = [f for f in c["frames"] if f in ends and f not in have]
+            have |= set(c["frames"])
+        if c["frames"]:
+            kept.append(c)
+    d["constraints"] = kept
+    for frame in sorted(ends - have):
+        d["constraints"].append(
+            {"id": _new_id(d, "constraints", "c"), "type": "root2d", "frames": [frame], LOCKED: True}
+        )
+    return before != [(c["id"], list(c["frames"])) for c in d["constraints"]]
 
 
 def move_check(d, runs_, delta):
@@ -92,19 +119,18 @@ def move_check(d, runs_, delta):
     in_the_way = set()
     for cid, run in runs_:
         ctype = _find(d, "constraints", cid)["type"]
-        in_the_way |= {(ctype, f) for f in _taken(d, ctype, skip=moving) & {f + delta for f in run}}
+        in_the_way |= {(ctype, f) for f in _taken(d, ctype, skip=moving, markers=True) & {f + delta for f in run}}
     return delta, sorted(in_the_way)
 
 
 def move_runs(d, runs_, delta):
-    delta, replaced = move_check(d, runs_, delta)
+    delta = move_check(d, runs_, delta)[0]
     if delta == 0:
         return {}
     moving = {(cid, f) for cid, run in runs_ for f in run}
-    for ctype, frame in replaced:
-        for c in d["constraints"]:
-            if c["type"] == ctype and frame in c["frames"] and (c["id"], frame) not in moving:
-                c["frames"] = [f for f in c["frames"] if f != frame]
+    landing = {(_find(d, "constraints", cid)["type"], f + delta) for cid, f in moving}
+    for c in d["constraints"]:
+        c["frames"] = [f for f in c["frames"] if (c["id"], f) in moving or (c["type"], f) not in landing]
     moved = {}
     for cid, run in runs_:
         moved.setdefault(cid, {}).update({f: f + delta for f in run})
@@ -132,8 +158,9 @@ def add_range(d, ctype, first, last):
 
 
 def add_keyframe(d, ctype, frame):
-    if frame in _taken(d, ctype):
-        return None
+    for c in d["constraints"]:
+        if c["type"] == ctype and frame in c["frames"]:
+            return c["id"] if c.pop(LOCKED, None) else None
     cid = _new_id(d, "constraints", "c")
     d["constraints"].append({"id": cid, "type": ctype, "frames": [frame]})
     return cid
@@ -165,7 +192,7 @@ def change_runs(d, runs_, ctype):
     """runs to another type, runs of that type stay"""
     runs_ = [(cid, run) for cid, run in runs_ if _find(d, "constraints", cid)["type"] != ctype]
     frames = {f for _, run in runs_ for f in run}
-    replaced = sorted(frames & _taken(d, ctype))
+    replaced = sorted(frames & _taken(d, ctype, markers=True))
     for cid in split_runs(d, runs_):
         c = _find(d, "constraints", cid)
         c["type"] = "changing"

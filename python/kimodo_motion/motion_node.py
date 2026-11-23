@@ -14,7 +14,7 @@ import time
 import hou
 import numpy as np
 
-from . import client, constraints, doc, examples, rig, rootpath, skeleton
+from . import client, constraints, doc, examples, rig, rootpath, skeleton, timeline
 
 _running = {}
 _status = {}
@@ -169,13 +169,20 @@ _pose_of = {}
 _was_auto = {}
 _made = {}
 _foreign = {}
-_tracked = set()
+
+
+def _listen(node, callback):
+    if any(heard == callback for _, heard in node.eventCallbacks()):
+        return False
+    node.addEventCallback((hou.nodeEventType.ParmTupleChanged,), callback)
+    return True
 
 
 def _track(node):
-    if node.sessionId() not in _tracked:
-        _tracked.add(node.sessionId())
-        node.addEventCallback((hou.nodeEventType.ParmTupleChanged,), _on_stash_changed)
+    sid = node.sessionId()
+    if _listen(node, _on_stash_changed) and sid in _foreign:
+        _foreign[sid] += 1
+    _foreign.setdefault(sid, 0)
 
 
 def _on_stash_changed(node, event_type, **kwargs):
@@ -618,13 +625,17 @@ def add_constraint(node, ctype, frame, auto=False):
     _flush(node)
     sync_poses(node)
     d = read_doc(node)
-    if any(c["type"] == ctype and frame in c["frames"] for c in d["constraints"]):
-        return None
     before = _taken(types_at(d).get(frame, ()))
-    entry = {"id": _new_id(d), "type": ctype, "frames": [frame]}
-    if auto:
-        entry["auto"] = True
-    d["constraints"].append(entry)
+    entry = next((c for c in d["constraints"] if c["type"] == ctype and frame in c["frames"]), None)
+    if entry is not None and not entry.get(timeline.LOCKED):
+        return None
+    if entry is not None:
+        entry.pop(timeline.LOCKED)
+    else:
+        entry = {"id": _new_id(d), "type": ctype, "frames": [frame]}
+        if auto:
+            entry["auto"] = True
+        d["constraints"].append(entry)
     raw = dict(_raw_poses(node))
     had = frame in raw
     if not had:
@@ -679,6 +690,7 @@ def paste_pose(node, ctype, frame, keep_root=False):
         entry = {"id": _new_id(d), "type": ctype, "frames": [frame]}
         d["constraints"].append(entry)
     entry.pop("auto", None)
+    entry.pop(timeline.LOCKED, None)
     raw = dict(_raw_poses(node))
     with hou.undos.group(f"{OWN_UNDO}paste pose at frame {frame + 1}"):
         rig.set_keys(node, frame, keys)
@@ -731,12 +743,14 @@ def _result(node):
     return _results[text]
 
 
-def store_result(node, samples, key, applied, sent=None, poses=None):
-    result = {"key": key, "applied": applied, "samples": [pack_sample(*s) for s in samples]}
-    if sent is not None:
-        result["sent"] = sent
-    if poses is not None:
-        result["poses"] = {str(f): p for f, p in sorted(poses.items())}
+def store_result(node, samples, key, applied, sent, poses):
+    result = {
+        "key": key,
+        "applied": applied,
+        "sent": sent,
+        "poses": {str(f): p for f, p in sorted(poses.items())},
+        "samples": [pack_sample(*s) for s in samples],
+    }
     with hou.undos.disabler():
         node.parm(RESULT).set(json.dumps(result) if samples else "")
     _rig_motions.pop(node.sessionId(), None)
@@ -818,8 +832,6 @@ def changed_keyframes(node):
         now = constraints.frame_entries(constraints_json(node, read_doc(node), keyframes=True))
         if not result["samples"]:
             _changed[key] = set(now)
-        elif "sent" not in result:
-            _changed[key] = set()
         else:
             sent = constraints.frame_entries(result["sent"])
             _changed[key] = {k for k, v in now.items() if sent.get(k) != v}
@@ -827,8 +839,7 @@ def changed_keyframes(node):
 
 
 def can_reset(node):
-    result = _result(node)
-    return bool(result["samples"]) and "poses" in result
+    return bool(_result(node)["samples"])
 
 
 def generated_pose(node, frame):
@@ -886,6 +897,10 @@ def import_folder(node, folder, what=None):
         for frame, pose in poses[c["id"]].items():
             if pose.local_rots is not None or frame not in raw:
                 raw[frame] = raw_pose(pose)
+    timeline.keep_path_ends(d, bool(settings.get("smooth_root_path", node.evalParm("smooth_root_path"))))
+    for frame in constraint_frames(d):
+        if frame not in raw:
+            raw[frame] = raw_pose(base_pose(node, frame))
     _flush(node)
     with hou.undos.group(OWN_UNDO + what):
         write_doc(node, d)
@@ -908,6 +923,7 @@ def export_folder(node, folder):
     _flush(node)
     sync_poses(node)
     d = doc_from_parms(node)
+    d["constraints"] = [c for c in d["constraints"] if not c.get(timeline.LOCKED)]
     settings = {name: node.evalParm(name) for name in SETTINGS}
     for name in ("postprocess", "smooth_root_path"):
         settings[name] = bool(settings[name])
@@ -1301,12 +1317,14 @@ def watch(node):
     if not hou.isUIAvailable():
         return
     sid = node.sessionId()
+    _track(node)
+    _listen(node, _on_parm_changed)
+    if node.cachedUserData("apexanimate:onenter") is None:
+        node.setCachedUserData("apexanimate:onenter", _on_enter_state)
     if sid in _watched:
         return
     _watched[sid] = [False, -1]
-    node.setCachedUserData("apexanimate:onenter", _on_enter_state)
     _changes.setdefault(sid, 0)
-    node.addEventCallback((hou.nodeEventType.ParmTupleChanged,), _on_parm_changed)
     if _poll not in hou.ui.eventLoopCallbacks():
         hou.ui.addEventLoopCallback(_poll)
 
@@ -1388,13 +1406,12 @@ def _poll_watched():
     for sid in list(_watched):
         node = hou.nodeBySessionId(sid)
         if node is None:
-            del _watched[sid]
             continue
         try:
             poll(node)
             _watch_errors.pop(sid, None)
         except hou.ObjectWasDeleted:
-            del _watched[sid]
+            pass
         except Exception as e:
             text = f"{type(e).__name__}: {e}"
             if _watch_errors.get(sid) != text:
@@ -1407,6 +1424,8 @@ def show_pinned_controls(node, viewer):
     import apex.control_2 as ac
     import apex.ui.statecommandutils as scu
 
+    if POSE_STATE_PROBLEM:
+        return
     shown = _shown.setdefault(node.sessionId(), {})
     everything = rig.pose_controls()
     pinned = pinned_at(read_doc(node), int(round(hou.frame())) - 1)
@@ -1472,6 +1491,7 @@ def follow_undo(node, viewer):
 def poll(node):
     """one look at a watched node"""
     sid = node.sessionId()
+    watch(node)
     seen = _watched[sid]
     if pose_state() == STOCK_STATE:
         for viewer in scene_viewers():

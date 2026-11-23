@@ -222,7 +222,6 @@ class StatusWidget(QtWidgets.QFrame):
         if shown == self.shown:
             return
         self.shown = shown
-        self.text.setToolTip("")
         self.dot.setStyleSheet(f"background: {STAGE_COLORS.get(stage, '#8a8a8a')}; border-radius: 5px;")
         self.text.setText(st["text"])
         self.elapsed.setText(elapsed)

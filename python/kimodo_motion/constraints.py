@@ -71,7 +71,7 @@ def first_heading_angle(cjson):
             c, s = e["global_root_heading"][e["frame_indices"].index(0)]
             return float(np.arctan2(s, c))
     for e in cjson:
-        if e["type"] == "fullbody" and 0 in e["frame_indices"]:
+        if e["type"] in POSE_TYPES and 0 in e["frame_indices"]:
             i = e["frame_indices"].index(0)
             c, s = heading_of(Pose(axis_angle_to_matrix(np.array(e["local_joints_rot"][i])), np.array(e["root_positions"][i])))
             return float(np.arctan2(s, c))

@@ -190,13 +190,14 @@ class Canvas(panel_parts.TimelineCanvas):
             if event.key() == QtCore.Qt.Key_Delete and selected:
                 self.runs_delete_requested.emit(selected)
             elif event.key() == QtCore.Qt.Key_C and selected:
-                self.markers_copy_requested.emit(selected, False)
+                self.copy_markers(selected)
             elif event.key() == QtCore.Qt.Key_X and selected:
+                self.copy_one_pose(selected)
                 self.markers_cut_requested.emit(selected)
             elif event.key() == QtCore.Qt.Key_V:
                 self.markers_paste_requested.emit(self.frame)
             elif event.key() == QtCore.Qt.Key_A:
-                self.marked = {(c["id"], f) for c in self.constraints for f in c["frames"]}
+                self.marked = {(c["id"], f) for c in self.markers() for f in c["frames"]}
                 self.update()
         elif event.key() == QtCore.Qt.Key_Space:
             self.play_requested.emit()
@@ -204,6 +205,18 @@ class Canvas(panel_parts.TimelineCanvas):
             self.step_requested.emit(-1 if event.key() == QtCore.Qt.Key_Left else 1)
         else:
             super().keyPressEvent(event)
+
+    def copy_one_pose(self, ids):
+        if len(ids) == 1 and len(ids[0][1]) == 1:
+            self.copy_requested.emit(ids[0][1][0])
+
+    def copy_markers(self, ids):
+        self.copy_one_pose(ids)
+        self.markers_copy_requested.emit(ids, False)
+
+    def markers(self):
+        """all constraints but the end waypoints smooth path keeps"""
+        return [c for c in self.constraints if not c.get(timeline.LOCKED)]
 
     def row_at(self, pos):
         """-1 ruler, 0 clips, 1.. tracks, None below"""
@@ -239,7 +252,7 @@ class Canvas(panel_parts.TimelineCanvas):
         ctype, scale = panel_parts.TRACK_TYPES[row - 1], self.scale()
         reach = max(self.m.row_h // 2, 6)
         found = None
-        for c in self.constraints:
+        for c in self.markers():
             if c["type"] != ctype:
                 continue
             for run in timeline.runs(c["frames"]):
@@ -260,7 +273,7 @@ class Canvas(panel_parts.TimelineCanvas):
         return any((c["type"], f) in self.changed for f in run)
 
     def marked_runs(self):
-        return [(c, run) for c in self.constraints for run in timeline.runs(c["frames"]) if self.is_marked(c, run)]
+        return [(c, run) for c in self.markers() for run in timeline.runs(c["frames"]) if self.is_marked(c, run)]
 
     def marker_rect(self, ctype, run):
         scale, y, size = self.scale(), self.track_y(ctype), max(self.m.row_h // 2 - 2, 4)
@@ -271,7 +284,7 @@ class Canvas(panel_parts.TimelineCanvas):
     def runs_in(self, rect):
         return {
             (c["id"], f)
-            for c in self.constraints
+            for c in self.markers()
             for run in timeline.runs(c["frames"])
             if self.marker_rect(c["type"], run).intersects(rect)
             for f in run
@@ -348,7 +361,7 @@ class Canvas(panel_parts.TimelineCanvas):
             actions[action] = call
 
         if selected:
-            add("Copy Selected Poses", lambda: self.markers_copy_requested.emit(ids, False))
+            add("Copy Selected Poses", lambda: self.copy_markers(ids))
         elif c is not None:
             x = event.position().x() / self.scale() - 0.5
             frame = min(run, key=lambda f: abs(f - x))
@@ -406,7 +419,6 @@ class Canvas(panel_parts.TimelineCanvas):
                     "x": pos.x(),
                     "delta": 0,
                     "moved": False,
-                    "ok": True,
                     "shift": shift,
                     "runs": [(c, run)],
                 }
@@ -435,7 +447,7 @@ class Canvas(panel_parts.TimelineCanvas):
             runs = [(c["id"], run) for c, run in drag["runs"]]
             shown = {"prompts": self.prompts, "constraints": self.constraints}
             delta, replaced = timeline.move_check(shown, runs, round((pos.x() - drag["x"]) / self.scale()))
-            drag["delta"], drag["ok"] = delta, True
+            drag["delta"] = delta
             where = (
                 f"Move to frame {drag['run'][0] + delta + 1}"
                 if len(runs) == 1
@@ -604,7 +616,7 @@ class Canvas(panel_parts.TimelineCanvas):
             self.paint_constraint(p, {"type": "root2d"}, list(range(waypoints[0], waypoints[-1] + 1)), 70)
         drag = self.drag or {"kind": ""}
         moving = ({(c["id"], f) for c, run in drag["runs"] for f in run} if drag["kind"] == "move" and drag["moved"] else set())
-        for c in self.constraints:
+        for c in self.markers():
             staying = [f for f in c["frames"] if (c["id"], f) not in moving]
             for run in timeline.runs(staying):
                 self.paint_constraint(p, c, run, marked=self.is_marked(c, run), changed=self.is_changed(c, run))
@@ -614,7 +626,6 @@ class Canvas(panel_parts.TimelineCanvas):
                     p,
                     c,
                     run,
-                    255 if drag["ok"] else 90,
                     marked=self.is_marked(c, [f - drag["delta"] for f in run]),
                     changed=bool(drag["delta"]) or self.is_changed(c, [f - drag["delta"] for f in run]),
                 )
@@ -714,8 +725,10 @@ class Panel(panel_parts.KimodoPanel):
         canvas.markers_cut_requested.connect(lambda runs: self.edit(timeline_edit.cut_runs, runs))
         canvas.markers_paste_requested.connect(self.paste_markers)
         canvas.range_requested.connect(lambda ctype, a, b: self.edit(timeline_edit.add_range, ctype, a, b))
-        canvas.heading_requested.connect(lambda runs, on: self.edit(timeline_edit.set_heading, runs, on))
-        canvas.runs_type_requested.connect(lambda runs, ctype: self.edit(timeline_edit.change_runs, runs, ctype))
+        canvas.heading_requested.connect(lambda runs, on: self.edit_markers(timeline_edit.set_heading, runs, on))
+        canvas.runs_type_requested.connect(
+            lambda runs, ctype: self.edit_markers(timeline_edit.change_runs, runs, ctype, to=ctype)
+        )
         canvas.hint_changed.connect(self.show_hover_hint)
         canvas.play_requested.connect(self.toggle_play)
         canvas.step_requested.connect(lambda step: hou.setFrame(max(int(round(hou.frame())) + step, 1)))
@@ -760,7 +773,7 @@ class Panel(panel_parts.KimodoPanel):
             canvas.resettable = motion_node.can_reset(node)
             self.reset_button.setEnabled(bool(canvas.marked) and canvas.can_reset(canvas.marked_runs()))
             if motion_node.is_editing(node) and not canvas.busy_selecting():
-                posed = {(c["id"], f) for c in canvas.constraints for f in (timeline.run_at(c, canvas.frame) or ())}
+                posed = {(c["id"], f) for c in canvas.markers() for f in (timeline.run_at(c, canvas.frame) or ())}
                 if posed != canvas.marked:
                     canvas.marked = posed
                     canvas.update()
@@ -818,6 +831,18 @@ class Panel(panel_parts.KimodoPanel):
             motion_node.set_status(self.node, f"Not done: {e}.")
         self.refresh()
         return result
+
+    def edit_markers(self, fn, runs, *args, to=None):
+        """an edit that can split markers off into constraints of their own"""
+        canvas = self.timeline.canvas
+        types = {c["id"]: c["type"] for c in canvas.constraints}
+        acted = {(cid, f) for cid, run in runs for f in run}
+        wanted = {(to if to and (cid, f) in acted else types[cid], f) for cid, f in canvas.marked if cid in types}
+        done = self.edit(fn, runs, *args)
+        if done:
+            canvas.marked = {(c["id"], f) for c in canvas.constraints for f in c["frames"] if (c["type"], f) in wanted}
+            canvas.update()
+        return done
 
     def move_runs(self, runs, delta):
         canvas = self.timeline.canvas

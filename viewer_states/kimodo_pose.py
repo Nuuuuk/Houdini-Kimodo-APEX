@@ -26,6 +26,10 @@ NEEDED_METHODS = (
     "onKeyTransitEvent",
     "onMouseEvent",
     "_frameSelectedControls",
+    "writeToSopNode",
+    "runSceneCallbacks",
+    "_showControlsCmd",
+    "_selectControlsCmd",
 )
 NEEDED_FUNCTIONS = ("_buildHudGeneralRows", "bindStateParms", "createViewerStateTemplate", "ANIMATE_TOOL_ICON")
 NEEDED_ATTRIBUTES = (
@@ -44,6 +48,7 @@ NEEDED_ATTRIBUTES = (
             "is_ctrl_pressed",
             "scene",
             "scene_callbacks",
+            "control_selection",
         ),
     ),
     ("apex.ui.settingshudwidgets", "AnimateSettingsWidget", ("widgethotkey", "hud_window")),
@@ -72,6 +77,8 @@ def _missing():
     import importlib
 
     try:
+        import apex
+        import apex.control_2 as control_2
         import apex.scene_2 as scene_2
         import apex.stateutils_2 as asu
         import apex.ui.statecommandutils as scu
@@ -99,9 +106,17 @@ def _missing():
         (stateutils, "defineHotkey"),
         (scene_2.SceneShapeOutputDrawable, "update"),
         (scene_2.Scene, "getGraphOutputData"),
+        (scu, "getAnimateState"),
+        (scene_2.Scene, "control_manager"),
+        (scene_2.Scene, "getData"),
+        (scene_2.Scene, "findDataPaths"),
+        (getattr(apex, "ControlManager", None), "controls"),
+        (getattr(apex, "Control", None), "node_properties"),
+        (control_2, "getEnabledControlsFromTemplate"),
+        (control_2, "setControlTemplateEnabled"),
     ):
         if not hasattr(module, name):
-            missing.append(f"{module.__name__}.{name}")
+            missing.append(f"{getattr(module, '__name__', 'apex')}.{name}")
     for label, cls, names in classes:
         missing += [f"{label}.{name}" for name in names if cls is None or not _sets(cls, name)]
     return missing
