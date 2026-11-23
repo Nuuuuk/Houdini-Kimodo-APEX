@@ -14,10 +14,9 @@ PLAYHEAD_REACH = 4
 HINTS = {
     "prompts": "Prompts: click empty space to add · double-click to edit · drag the right edge for length · "
     "right-click to delete",
-    "constraints": "Constraints: click a track for a keyframe at that frame · click a marker to select it · Delete "
-    "deletes the selected · Ctrl+C, Ctrl+X, Ctrl+V copy, cut and paste them · Ctrl+A selects all · "
-    "Shift+click to add or remove · drag empty space to select · drag to move · "
-    "Ctrl+drag for a range · right-click to reset, delete or change type",
+    "constraints": "Constraints: click to add a keyframe · Ctrl+drag for a range · click a marker to select it, "
+    "Shift+click for more, drag empty space for a box · drag to move · Delete · Ctrl+C, X, V, A · "
+    "right-click for more",
     "ruler": "Ruler: click or drag to set the frame · wheel pans · Shift+wheel zooms · Space plays · "
     "Left/Right step a frame",
     "": "",
@@ -25,6 +24,7 @@ HINTS = {
 ZOOM_STEP, ZOOM_MIN, ZOOM_MAX = 1.25, 0.3, 8.0
 COPY_KEYS = (QtCore.Qt.Key_C, QtCore.Qt.Key_X, QtCore.Qt.Key_V, QtCore.Qt.Key_A)
 CLIP_RGB = (70, 120, 200)
+PLAYHEAD_RGB = (230, 90, 60)
 OUTLINE = 2.0
 MOVES_KEPT = 50
 
@@ -595,22 +595,22 @@ class Canvas(panel_parts.TimelineCanvas):
 
     def paintEvent(self, event):
         p = QtGui.QPainter(self)
-        pal = self.palette()
+        look = panel_parts.Look(self.palette())
         ruler_h, row_h, scale = self.m.ruler_h, self.m.row_h, self.scale()
-        text = pal.color(QtGui.QPalette.Text)
         prompts = self.shown_prompts()
         end_x = int((prompts[-1]["end_frame"] if prompts else self.total) * scale)
+        p.fillRect(self.rect(), look.line)
+        p.fillRect(0, 0, self.width(), ruler_h - 1, look.ruler)
         for i in range(len(panel_parts.TRACKS)):
-            role = QtGui.QPalette.AlternateBase if i % 2 else QtGui.QPalette.Base
-            p.fillRect(0, ruler_h + i * row_h, self.width(), row_h - 1, pal.color(role))
-        p.fillRect(end_x, 0, self.width() - end_x, self.height(), QtGui.QColor(0, 0, 0, 70))
-        self.paint_ruler(p, text, end_x)
+            p.fillRect(0, ruler_h + i * row_h, self.width(), row_h - 1, look.row_alt if i % 2 else look.row)
+        self.paint_ruler(p, look, end_x)
+        p.fillRect(end_x, 0, self.width() - end_x, self.height(), look.beyond)
         x = int(self.frame_x(self.frame))
-        p.setPen(QtGui.QPen(QtGui.QColor(230, 90, 60), 2))
-        p.drawLine(x, 0, x, self.height())
-        for pr in prompts:
-            self.paint_prompt(p, pr)
+        p.setPen(QtGui.QPen(QtGui.QColor(*PLAYHEAD_RGB), 2))
+        p.drawLine(x, ruler_h, x, self.height())
         p.setRenderHint(QtGui.QPainter.Antialiasing)
+        for pr in prompts:
+            self.paint_prompt(p, look, pr)
         waypoints = sorted(f for c in self.constraints if c["type"] == "root2d" for f in c["frames"])
         if self.smooth_path and len(waypoints) > 1:
             self.paint_constraint(p, {"type": "root2d"}, list(range(waypoints[0], waypoints[-1] + 1)), 70)
@@ -636,38 +636,75 @@ class Canvas(panel_parts.TimelineCanvas):
             p.setPen(QtGui.QPen(QtGui.QColor(255, 255, 255, 170), 1))
             p.setBrush(QtGui.QColor(255, 255, 255, 30))
             p.drawRect(QtCore.QRectF(QtCore.QRect(drag["start"], drag["end"]).normalized()))
-        p.setRenderHint(QtGui.QPainter.Antialiasing, False)
+        self.paint_playhead(p, x)
         p.end()
 
-    def paint_ruler(self, p, color, end_x):
+    def paint_ruler(self, p, look, end_x):
         ruler_h, scale = self.m.ruler_h, self.scale()
         label_w = p.fontMetrics().horizontalAdvance("00s") + 8
         step = next(s for s in (1, 2, 5, 10, 30, 60) if s * doc.FPS * scale >= label_w or s == 60)
-        p.setPen(color)
-        for second in range(self.span() // doc.FPS + 1):
-            x = int(self.frame_x(second * doc.FPS))
+        minor = next(n for n in (5, 10, 15, doc.FPS) if n * scale >= 5 or n == doc.FPS)
+        for frame in range(0, self.span() + 1, minor):
+            x = int(self.frame_x(frame))
             if x > end_x:
                 break
-            p.drawLine(x, ruler_h - (6 if second % step == 0 else 3), x, ruler_h - 1)
-            if second % step == 0:
-                p.drawText(x + 3, ruler_h - 6, f"{second}s")
+            second, rest = divmod(frame, doc.FPS)
+            labeled = rest == 0 and second % step == 0
+            p.setPen(look.dim)
+            p.drawLine(x, ruler_h - (7 if labeled else 5 if rest == 0 else 3), x, ruler_h - 2)
+            if labeled:
+                p.setPen(look.grid)
+                p.drawLine(x, ruler_h, x, self.height())
+                p.setPen(look.text)
+                p.drawText(x + 4, ruler_h - 6, f"{second}s")
 
-    def paint_prompt(self, p, pr):
-        rect = self.prompt_rect(pr)
-        p.fillRect(rect, QtGui.QColor(*CLIP_RGB))
-        p.fillRect(rect.right() - 2, rect.top(), 3, rect.height(), QtGui.QColor(150, 190, 245))
+    def paint_playhead(self, p, x):
+        h = float(self.m.ruler_h)
+        half, top, shoulder = max(round(h * 0.28), 4), 1.0, h * 0.55
+        p.setPen(QtCore.Qt.NoPen)
+        p.setBrush(QtGui.QColor(*PLAYHEAD_RGB))
+        p.drawPolygon(
+            QtGui.QPolygonF(
+                [
+                    QtCore.QPointF(x - half, top),
+                    QtCore.QPointF(x + half, top),
+                    QtCore.QPointF(x + half, shoulder),
+                    QtCore.QPointF(x, h - 1.0),
+                    QtCore.QPointF(x - half, shoulder),
+                ]
+            )
+        )
+
+    def paint_prompt(self, p, look, pr):
+        rect = QtCore.QRectF(self.prompt_rect(pr)).adjusted(0.5, 0.5, -0.5, -0.5)
+        fill, width = QtGui.QColor(*CLIP_RGB), outline_width()
+        radius = min(2.0 * width, rect.height() / 3.0)
+        p.setPen(QtGui.QPen(fill.darker(170), 1.0))
+        p.setBrush(fill)
+        p.drawRoundedRect(rect, radius, radius)
+        if rect.width() > 16:
+            block = QtGui.QPainterPath()
+            block.addRoundedRect(rect, radius, radius)
+            p.save()
+            p.setClipPath(block)
+            p.fillRect(QtCore.QRectF(rect.right() - 3.0, rect.top(), 3.5, rect.height()), QtGui.QColor(150, 190, 245))
+            p.restore()
         if pr["id"] == self.selected:
-            width = outline_width()
             p.setPen(QtGui.QPen(QtGui.QColor(255, 255, 255), width))
             p.setBrush(QtCore.Qt.NoBrush)
-            p.drawRect(QtCore.QRectF(rect).adjusted(width / 2, width / 2, -width / 2, -width / 2))
-        p.setPen(QtGui.QColor(255, 255, 255))
+            inner = rect.adjusted(width / 2, width / 2, -width / 2, -width / 2)
+            p.drawRoundedRect(inner, max(radius - width / 2, 0.0), max(radius - width / 2, 0.0))
         fm = p.fontMetrics()
         length = f"{(pr['end_frame'] - pr['start_frame']) / doc.FPS:.1f} s"
-        inner = rect.adjusted(4, 0, -6, 0)
+        inner = self.prompt_rect(pr).adjusted(6, 0, -9, 0)
+        area = self.scroll_area()
+        if area is not None:
+            inner.setLeft(min(max(inner.left(), area.horizontalScrollBar().value() + 6), inner.right()))
         if inner.width() > fm.horizontalAdvance(length) * 3:
+            p.setPen(QtGui.QColor(255, 255, 255, 185))
             p.drawText(inner, QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter, length)
             inner.setRight(inner.right() - fm.horizontalAdvance(length) - 8)
+        p.setPen(QtGui.QColor(255, 255, 255))
         p.drawText(
             inner,
             QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter,
@@ -681,7 +718,11 @@ class Canvas(panel_parts.TimelineCanvas):
         scale, y = self.scale(), self.track_y(c["type"])
         size = max(self.m.row_h // 2 - 2, 4)
         color = QtGui.QColor(*(motion_node.UNAPPLIED_MARKER_RGB if changed else motion_node.MARKER_RGB), alpha)
-        outline = QtGui.QPen(QtGui.QColor(255, 255, 255, alpha), outline_width()) if marked else QtCore.Qt.NoPen
+        outline = (
+            QtGui.QPen(QtGui.QColor(255, 255, 255, alpha), outline_width())
+            if marked
+            else QtGui.QPen(QtGui.QColor(0, 0, 0, alpha * 130 // 255), 1.0)
+        )
         p.setBrush(color)
         for run in timeline.runs(c["frames"] if frames is None else frames):
             p.setPen(outline)

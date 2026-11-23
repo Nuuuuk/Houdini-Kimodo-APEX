@@ -33,6 +33,19 @@ def paste_entries(ctype, frame):
     return [(f"Paste Pose at Frame {n}", False)]
 
 
+class Look:
+    def __init__(self, palette):
+        base = palette.color(QtGui.QPalette.Base)
+        self.text = palette.color(QtGui.QPalette.Text)
+        self.dim = QtGui.QColor(self.text)
+        self.dim.setAlpha(150)
+        self.row, self.row_alt = base.darker(140), base.darker(127)
+        self.ruler, self.header = base.darker(170), base.darker(112)
+        self.line = base.darker(240)
+        self.grid = QtGui.QColor(255, 255, 255, 13)
+        self.beyond = QtGui.QColor(0, 0, 0, 95)
+
+
 class Metrics:
     def __init__(self, widget):
         fm = widget.fontMetrics()
@@ -67,10 +80,15 @@ class TrackLabels(FontSized):
 
     def paintEvent(self, event):
         p = QtGui.QPainter(self)
-        p.setPen(self.palette().color(QtGui.QPalette.Text))
+        look = Look(self.palette())
+        width, ruler_h, row_h = self.width() - 1, self.m.ruler_h, self.m.row_h
+        p.fillRect(self.rect(), look.line)
+        p.fillRect(0, 0, width, ruler_h - 1, look.ruler)
+        p.setPen(look.text)
         for i, name in enumerate(TRACKS):
+            p.fillRect(0, ruler_h + i * row_h, width, row_h - 1, look.header)
             p.drawText(
-                QtCore.QRect(6, self.m.ruler_h + i * self.m.row_h, self.m.label_w - 8, self.m.row_h),
+                QtCore.QRect(6, ruler_h + i * row_h, self.m.label_w - 8, row_h - 1),
                 QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter,
                 name,
             )
@@ -123,6 +141,7 @@ class TimelineArea(QtWidgets.QWidget):
         scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
         scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
         self.labels, self.scroll = TrackLabels(), scroll
+        scroll.horizontalScrollBar().valueChanged.connect(lambda _: self.canvas.update())
         row.addWidget(self.labels, 0, QtCore.Qt.AlignTop)
         row.addWidget(scroll, 1)
 
@@ -157,7 +176,7 @@ class StatusWidget(QtWidgets.QFrame):
 
     def __init__(self):
         super().__init__()
-        self.setFrameShape(QtWidgets.QFrame.StyledPanel)
+        self.setFrameShape(QtWidgets.QFrame.NoFrame)
         col = QtWidgets.QVBoxLayout(self)
         col.setContentsMargins(8, 6, 8, 6)
         col.setSpacing(4)
@@ -243,6 +262,11 @@ class StatusWidget(QtWidgets.QFrame):
 MENU_RIGHT = 310
 DIVIDER_SPACE = 8
 GENERATE_TALLER = 1.3
+ACCENT_RGB = (70, 120, 200)
+GENERATE_STYLE = (
+    "QPushButton {{ background-color: {normal}; color: white; border: 1px solid {edge}; border-radius: {radius}px; }}"
+    " QPushButton:hover {{ background-color: {hover}; }} QPushButton:pressed {{ background-color: {down}; }}"
+)
 
 
 def ui_scale():
@@ -404,6 +428,7 @@ class KimodoPanel(QtWidgets.QWidget):
         self.stack.addWidget(self.buttons, 0)
         self.stack.addWidget(self.divider_box, 0)
         self.stack.addStretch(1)
+        self.style_generate()
         self.place_buttons()
         self.timer = QtCore.QTimer(self)
         self.timer.setInterval(200)
@@ -442,6 +467,7 @@ class KimodoPanel(QtWidgets.QWidget):
                 return
             self.status.show_status(motion_node.get_status(self.node))
             self.generate_button.setText("Cancel" if self.node.evalParm("busy") else "Generate")
+            self.style_generate()
             self.clip_fields.refresh(self.node)
             self.place_buttons()
             self.status.show_hint(self.hover_hint or motion_node.pose_hint(self.node))
@@ -464,6 +490,23 @@ class KimodoPanel(QtWidgets.QWidget):
         """where the parm editor's menus end"""
         editor = self.parm_editor.mapTo(self, QtCore.QPoint(0, 0)).x() if self.parm_editor is not None else 0
         return editor + round(MENU_RIGHT * ui_scale())
+
+    def style_generate(self):
+        """generate in the clips' blue, plain while it reads cancel"""
+        accent = QtGui.QColor(*ACCENT_RGB)
+        style = (
+            ""
+            if self.generate_button.text() == "Cancel"
+            else GENERATE_STYLE.format(
+                normal=accent.name(),
+                hover=accent.lighter(115).name(),
+                down=accent.darker(120).name(),
+                edge=accent.darker(150).name(),
+                radius=max(round(3 * ui_scale()), 2),
+            )
+        )
+        if self.generate_button.styleSheet() != style:
+            self.generate_button.setStyleSheet(style)
 
     def place_buttons(self):
         left = self.timeline.labels.width()
