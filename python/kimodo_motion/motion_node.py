@@ -14,7 +14,7 @@ import time
 import hou
 import numpy as np
 
-from . import client, constraints, doc, examples, rig, rootpath, skeleton, timeline
+from . import body, client, constraints, doc, examples, rig, rootpath, skeleton, timeline
 
 _running = {}
 _status = {}
@@ -1563,6 +1563,8 @@ def cook_notice(sop):
     shown, asked = pose_frames(read_doc(node))
     if node.evalParm("show_poses") and len(shown) < asked:
         sop.addMessage(f"The viewer shows {len(shown)} of {asked} constraint poses.")
+    if node.evalParm("show_body") and _skin() is None:
+        sop.addMessage(NO_BODY)
     error = node.parm("error").unexpandedString()
     if node.evalParm("unapplied"):
         raise hou.NodeWarning(
@@ -1743,6 +1745,61 @@ def cook_poses(sop):
         geo.setPointFloatAttribValues("Cd", [v for c in colors for v in c])
         geo.setPointIntAttribValues(POSE_FRAME, frames)
         geo.createPolygons([tuple(made[i] for i in line) for line in lines], False)
+
+
+NO_BODY = "The installed Kimodo has no SOMA body (skin_standard.npz); no body is shown."
+
+
+def _skin():
+    return body.load(hou.getenv("KIMODO_MOTION") or "")
+
+
+def cook_body_mesh(sop):
+    """python sop: the body mesh at bind pose"""
+    geo, skin = sop.geometry(), _skin()
+    if skin is None:
+        return
+    geo.addAttrib(hou.attribType.Point, "N", (0.0, 0.0, 0.0))
+    geo.addAttrib(hou.attribType.Point, "Cd", body.COLOR)
+    geo.addAttrib(hou.attribType.Point, "Alpha", body.ALPHA)
+    geo.createPoints(skin.vertices.tolist())
+    geo.setPointFloatAttribValues("N", skin.normals.ravel().tolist())
+    # houdini's polygons wind the other way
+    geo.createPolygons(skin.faces[:, ::-1].tolist())
+
+
+def cook_body(sop):
+    """python sop: the body on the shown sample"""
+    geo, skin = sop.geometry(), _skin()
+    frame = hou.frame()
+    positions, world = _motion_pose(shown_motion(sop.parent()), int(round(frame)) - 1)
+    if skin is None or geo.intrinsicValue("pointcount") != len(skin.vertices):
+        return
+    vertices, normals = skin.posed(positions, world)
+    geo.setPointFloatAttribValuesFromString("P", vertices)
+    geo.setPointFloatAttribValuesFromString("N", normals)
+
+
+def posed_body(node, frame, rig_pose):
+    """the body on the pose the pose state shows"""
+    skin = _skin()
+    if skin is None:
+        return None
+    types = _types(node).get(frame, set())
+    if types - {"root2d"}:
+        local, root = _frame_pose(shown_motion(node), frame)
+        positions, world = skeleton.composed_pose(
+            local,
+            root,
+            rig_pose.local_rots,
+            rig_pose.root_position,
+            rig_pose.root_2d,
+            types,
+            held_heading(node, frame, rig_pose),
+        )
+    else:
+        positions, world = skeleton.fk(rig_pose.local_rots, rig_pose.root_position)
+    return skin.posed(positions, world)
 
 
 def constraint_label(node, frame):

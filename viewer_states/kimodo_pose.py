@@ -11,6 +11,7 @@ STATE_LABEL = "Kimodo Pose"
 LABELS_KEY = "I"
 LABEL_BOX_COLOR = (0.0, 0.0, 0.0, 0.55)
 BOX_PAD = (9, 4)
+BODY_KEY = "B"
 UNPINNED_KEY = "U"
 NEEDED_METHODS = (
     "onDraw",
@@ -140,11 +141,15 @@ def _state_class():
         _mark_lines = None
         _mark_key = None
         _pose_key = None
+        show_body = True
+        _body = None
+        _body_key = None
         _pelvis = None
 
         def updateHUD(self):
             unpinned_key = su.hudHotkeyRef(self.hotkeys.toggle_unpinned)
             labels_key = su.hudHotkeyRef(self.hotkeys.toggle_labels)
+            body_key = su.hudHotkeyRef(self.hotkeys.toggle_body)
             self.scene_viewer.hudInfo(
                 template={
                     "title": self._title,
@@ -176,6 +181,8 @@ def _state_class():
                             "id": "showlabelsgroup",
                             "rows": [{"label": "Show Pose Labels", "key": labels_key}],
                         },
+                        {"type": "group", "id": "hidebodygroup", "rows": [{"label": "Hide Body", "key": body_key}]},
+                        {"type": "group", "id": "showbodygroup", "rows": [{"label": "Show Body", "key": body_key}]},
                         {"id": "finish", "label": "End Posing", "key": "Esc"},
                     ],
                 }
@@ -188,6 +195,8 @@ def _state_class():
                     "showunpinnedgroup__visible": not self.show_unpinned,
                     "hidelabelsgroup__visible": self.show_labels,
                     "showlabelsgroup__visible": not self.show_labels,
+                    "hidebodygroup__visible": self.show_body,
+                    "showbodygroup__visible": not self.show_body,
                 }
             )
 
@@ -255,6 +264,38 @@ def _state_class():
                     "the rig's own skeleton is shown.",
                 )
 
+        def _draw_body(self, draw_handle, frame):
+            from kimodo_motion import motion_node, rig
+
+            if self._body is None or not self.show_body or not self._rig_skeletons():
+                return
+            try:
+                node = self.scene_node
+                skel = self._rig_skeletons()[0]
+                rig_geo = self.scene.getGraphOutputData(skel.output_path, skel.data_key)
+                key = (
+                    frame,
+                    rig_geo.pointFloatAttribValues("P"),
+                    rig_geo.pointFloatAttribValues("transform"),
+                    node.parm("kimodo_doc").unexpandedString(),
+                    motion_node.shown_result(node),
+                )
+                if key != self._body_key:
+                    self._body_key = key
+                    posed = motion_node.posed_body(node, frame, rig.pose_from_geometry(rig_geo))
+                    geo = hou.Geometry()
+                    if posed is not None:
+                        geo.merge(node.node("body_mesh").geometry())
+                        geo.setPointFloatAttribValuesFromString("P", posed[0])
+                        geo.setPointFloatAttribValuesFromString("N", posed[1])
+                    self._body.setGeometry(geo)
+                self._body.setTransform(skel.drawable.transform())
+                self._body.draw(draw_handle)
+            except Exception as e:
+                self._body.show(False)
+                self._body = None
+                motion_node.set_status(self.scene_node, f"Kimodo could not draw the body ({type(e).__name__}: {e}).")
+
         def _draw_mark(self, draw_handle, frame):
             from kimodo_motion import motion_node
 
@@ -300,6 +341,7 @@ def _state_class():
             current = int(round(hou.frame())) - 1
             self._draw_pose(kwargs["draw_handle"], current)
             self._draw_mark(kwargs["draw_handle"], current)
+            self._draw_body(kwargs["draw_handle"], current)
             try:
                 from kimodo_motion import motion_node
 
@@ -355,7 +397,7 @@ def _state_class():
                 pass
 
         def onExit(self, kwargs):
-            for lines in (self._pose_lines, self._mark_lines):
+            for lines in (self._pose_lines, self._mark_lines, self._body):
                 if lines is not None:
                     lines.show(False)
             for drawable in (self._label_text, self._label_boxes):
@@ -392,7 +434,7 @@ def _state_class():
             pass
 
         def onEnter(self, kwargs):
-            self.show_unpinned = self.show_labels = True
+            self.show_unpinned = self.show_labels = self.show_body = True
             result = super().onEnter(kwargs)
             self._label_text = hou.TextDrawable(self.scene_viewer, "kimodo_pose_labels")
             self._label_text.show(True)
@@ -410,6 +452,16 @@ def _state_class():
                 params={"use_cd": True, "line_width": 2.0},
             )
             self._mark_lines.show(True)
+            from kimodo_motion import body
+
+            self._body = hou.GeometryDrawable(
+                self.scene_viewer,
+                hou.drawableGeometryType.Face,
+                "kimodo_body",
+                params={"color1": body.COLOR + (body.ALPHA,), "use_cd": False},
+            )
+            self._body.show(True)
+            self._body_key = None
             self._mark_key = None
             self._pose_key = None
             self._title = STATE_LABEL
@@ -445,6 +497,11 @@ def _state_class():
                 return True
             if hou.hotkeys.isKeyMatch(key, self.hotkeys.toggle_labels):
                 self.show_labels = not self.show_labels
+                self.updateHUD()
+                self.scene_viewer.curViewport().draw()
+                return True
+            if hou.hotkeys.isKeyMatch(key, self.hotkeys.toggle_body):
+                self.show_body = not self.show_body
                 self.updateHUD()
                 self.scene_viewer.curViewport().draw()
                 return True
@@ -509,6 +566,15 @@ def createViewerStateTemplate():
         LABELS_KEY,
         "Show or Hide Pose Labels",
         "Show or hide the labels of the constraint poses",
+        category,
+    )
+    hotkeys.toggle_body = su.defineHotkey(
+        hotkeys.definitions(),
+        STATE_NAME,
+        "toggle_body",
+        BODY_KEY,
+        "Show or Hide Body",
+        "Show or hide the SOMA body on the pose the rig shows",
         category,
     )
     template.bindFactory(lambda state_name, scene_viewer: State(state_name, scene_viewer, hotkeys))
