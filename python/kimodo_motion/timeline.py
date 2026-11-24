@@ -27,6 +27,10 @@ def _new_id(d, key, prefix):
     return next(f"{prefix}{n}" for n in range(1, len(used) + 2) if f"{prefix}{n}" not in used)
 
 
+def new_constraint_id(d):
+    return _new_id(d, "constraints", "c")
+
+
 def _find(d, key, item_id):
     for x in d[key]:
         if x["id"] == item_id:
@@ -105,9 +109,7 @@ def keep_path_ends(d, on):
             kept.append(c)
     d["constraints"] = kept
     for frame in sorted(ends - have):
-        d["constraints"].append(
-            {"id": _new_id(d, "constraints", "c"), "type": "root2d", "frames": [frame], LOCKED: True}
-        )
+        d["constraints"].append({"id": new_constraint_id(d), "type": "root2d", "frames": [frame], LOCKED: True})
     return before != [(c["id"], list(c["frames"])) for c in d["constraints"]]
 
 
@@ -152,7 +154,7 @@ def add_range(d, ctype, first, last):
         if c["frames"]:
             kept.append(c)
     d["constraints"] = kept
-    cid = _new_id(d, "constraints", "c")
+    cid = new_constraint_id(d)
     d["constraints"].append({"id": cid, "type": ctype, "frames": sorted(inside)})
     return cid
 
@@ -161,7 +163,7 @@ def add_keyframe(d, ctype, frame):
     for c in d["constraints"]:
         if c["type"] == ctype and frame in c["frames"]:
             return c["id"] if c.pop(LOCKED, None) else None
-    cid = _new_id(d, "constraints", "c")
+    cid = new_constraint_id(d)
     d["constraints"].append({"id": cid, "type": ctype, "frames": [frame]})
     return cid
 
@@ -182,7 +184,7 @@ def split_runs(d, runs_):
             ids.append(cid)
             continue
         c["frames"] = [f for f in c["frames"] if f not in set(run)]
-        part = {**c, "id": _new_id(d, "constraints", "c"), "frames": sorted(run)}
+        part = {**c, "id": new_constraint_id(d), "frames": sorted(run)}
         d["constraints"].append(part)
         ids.append(part["id"])
     return ids

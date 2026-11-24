@@ -30,14 +30,18 @@ MOVES_KEPT = 50
 
 
 def outline_width():
-    return OUTLINE * (hou.ui.globalScaleFactor() if hou.isUIAvailable() else 1.0)
+    return OUTLINE * panel_parts.ui_scale()
 
 
 def constraints_key(constraints):
     return tuple(sorted((c["id"], tuple(c["frames"])) for c in constraints))
 
 
-class Canvas(panel_parts.TimelineCanvas):
+class Canvas(panel_parts.FontSized):
+    frame_requested = QtCore.Signal(int)
+    edit_requested = QtCore.Signal()
+    copy_requested = QtCore.Signal(int)
+    paste_requested = QtCore.Signal(str, bool)
     prompt_add_requested = QtCore.Signal()
     prompt_text_requested = QtCore.Signal(str, str)
     prompt_resize_requested = QtCore.Signal(str, int)
@@ -59,6 +63,8 @@ class Canvas(panel_parts.TimelineCanvas):
     hint_changed = QtCore.Signal(str)
 
     def __init__(self):
+        self.prompts, self.constraints, self.total, self.frame = [], [], 5 * doc.FPS, 0
+        self.changed = set()
         self.drag = None
         self.preview = None
         self.editor, self.editing = None, None
@@ -80,14 +86,23 @@ class Canvas(panel_parts.TimelineCanvas):
     def scale(self):
         return max(self.width() / self.span(), self.m.px_per_frame)
 
+    def frame_x(self, frame):
+        """middle of the frame's cell"""
+        return (frame + 0.5) * self.scale()
+
     def apply_metrics(self):
         super().apply_metrics()
+        self.setFixedHeight(self.m.tracks_h)
         self.m.px_per_frame = max(1, round(self.m.px_per_frame * self.zoom))
         self.setMinimumWidth(self.span() * self.m.px_per_frame)
 
     def set_state(self, prompts, frame, constraints=()):
         before = self.frame
-        super().set_state(prompts, frame, constraints)
+        total = prompts[-1]["end_frame"] if prompts else 5 * doc.FPS
+        constraints = list(constraints)
+        if (prompts, frame, total, constraints) != (self.prompts, self.frame, self.total, self.constraints):
+            self.prompts, self.frame, self.total, self.constraints = prompts, frame, total, constraints
+            self.update()
         there = {(c["id"], f) for c in self.constraints for f in c["frames"]}
         if not self.marked <= there:
             self.marked = self.follow_moves() & there
@@ -748,10 +763,62 @@ class Canvas(panel_parts.TimelineCanvas):
                 p.setPen(QtCore.Qt.NoPen)
 
 
-class Panel(panel_parts.KimodoPanel):
+class Panel(QtWidgets.QWidget):
     def __init__(self, parm_editor_factory=None):
-        super().__init__(parm_editor_factory, canvas=Canvas())
+        super().__init__()
+        self.node = None
+        self.refreshing = False
+        self.hover_hint = ""
+        self.doc_text, self.doc = None, None
+        self.parm_editor = None
+        self.parm_editor_factory = parm_editor_factory or (lambda node: hou.qt.ParmDialog(node, compact=True))
+        self.timeline = panel_parts.TimelineArea(Canvas())
         canvas = self.timeline.canvas
+        canvas.frame_requested.connect(lambda frame: hou.setFrame(frame + 1))
+        canvas.edit_requested.connect(self.edit_pose)
+        canvas.copy_requested.connect(lambda frame: self.with_node(motion_node.copy_pose, frame))
+        canvas.paste_requested.connect(
+            lambda ctype, keep_root: self.with_node(
+                motion_node.paste_pose, ctype, motion_node.current_frame(), keep_root
+            )
+        )
+        self.status = panel_parts.StatusWidget()
+        self.status.dismissed.connect(self.dismiss_error)
+        self.buttons = QtWidgets.QWidget()
+        self.button_rows = QtWidgets.QVBoxLayout(self.buttons)
+        self.button_rows.setSpacing(4)
+        self.generate_button = QtWidgets.QPushButton("Generate")
+        self.generate_button.clicked.connect(self.press_generate)
+        self.button_rows.addWidget(self.generate_button, 0, QtCore.Qt.AlignLeft)
+        self.buttons.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed)
+        self.clip_fields = panel_parts.ClipFields()
+        self.divider = QtWidgets.QFrame()
+        self.divider.setFrameShape(QtWidgets.QFrame.HLine)
+        self.divider.setFrameShadow(QtWidgets.QFrame.Sunken)
+        self.divider_box = QtWidgets.QWidget()
+        around = QtWidgets.QVBoxLayout(self.divider_box)
+        around.setContentsMargins(0, panel_parts.DIVIDER_SPACE, 0, panel_parts.DIVIDER_SPACE)
+        around.addWidget(self.divider)
+        self.divider_box.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed)
+        self.clip_fields.run = self.edit_clip
+        self.clip_fields.preview = self.preview_clip
+        fixed = QtWidgets.QSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed)
+        self.timeline.setSizePolicy(fixed)
+        self.status.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Maximum)
+        self.stack = QtWidgets.QVBoxLayout(self)
+        self.stack.setContentsMargins(0, 0, 0, 0)
+        self.stack.setSpacing(4)
+        self.stack.addWidget(self.timeline, 0)
+        self.stack.addWidget(self.status, 0)
+        self.stack.addWidget(self.clip_fields, 0)
+        self.stack.addWidget(self.buttons, 0)
+        self.stack.addWidget(self.divider_box, 0)
+        self.stack.addStretch(1)
+        self.style_generate()
+        self.timer = QtCore.QTimer(self)
+        self.timer.setInterval(200)
+        self.timer.timeout.connect(self.tick)
+        self.timer.start()
         canvas.prompt_add_requested.connect(self.add_prompt)
         canvas.prompt_text_requested.connect(lambda pid, text: self.edit(timeline_edit.set_prompt_text, pid, text))
         canvas.prompt_resize_requested.connect(lambda pid, n: self.edit(timeline_edit.resize_prompt, pid, n))
@@ -790,9 +857,141 @@ class Panel(panel_parts.KimodoPanel):
             self.playbar_callback = self.on_playbar
             hou.playbar.addEventCallback(self.playbar_callback)
 
+    def tick(self):
+        """refresh between cooks, never inside one"""
+        motion_node.when_idle(("panel", id(self)), self.refresh_if_alive)
+
+    def refresh_if_alive(self):
+        try:
+            self.refresh()
+        except RuntimeError:
+            pass
+
+    def set_node(self, node):
+        self.node = node
+        if node is not None:
+            if self.parm_editor is None:
+                self.parm_editor = self.parm_editor_factory(node)
+                self.stack.takeAt(self.stack.count() - 1)
+                self.stack.addWidget(self.parm_editor, 1)
+            else:
+                self.parm_editor.setNode(node)
+            motion_node.watch(node)
+        self.refresh()
+
     def refresh(self):
         """cheap, runs five times a second"""
-        super().refresh()
+        self.refresh_node()
+        self.refresh_timeline()
+
+    def refresh_node(self):
+        if self.refreshing or not self.isVisible():
+            return
+        self.refreshing = True
+        try:
+            if self.node is None:
+                return
+            self.status.show_status(motion_node.get_status(self.node))
+            self.generate_button.setText("Cancel" if self.node.evalParm("busy") else "Generate")
+            self.style_generate()
+            self.clip_fields.refresh(self.node)
+            self.place_buttons()
+            self.status.show_hint(self.hover_hint or motion_node.pose_hint(self.node))
+            text = self.node.parm("kimodo_doc").unexpandedString()
+            if text != self.doc_text:
+                self.doc_text, self.doc = text, motion_node.read_doc(self.node)
+            d = self.doc
+            canvas = self.timeline.canvas
+            changed = motion_node.changed_keyframes(self.node)
+            if changed != canvas.changed:
+                canvas.changed = changed
+                canvas.update()
+            canvas.set_state(d["prompts"], motion_node.current_frame(), d["constraints"])
+        except (hou.ObjectWasDeleted, doc.DocError):
+            self.node = None
+        finally:
+            self.refreshing = False
+
+    def buttons_right(self):
+        """where the parm editor's menus end"""
+        editor = self.parm_editor.mapTo(self, QtCore.QPoint(0, 0)).x() if self.parm_editor is not None else 0
+        return editor + round(panel_parts.MENU_RIGHT * panel_parts.ui_scale())
+
+    def style_generate(self):
+        """generate in the clips' blue, plain while it reads cancel"""
+        accent = QtGui.QColor(*panel_parts.ACCENT_RGB)
+        style = (
+            ""
+            if self.generate_button.text() == "Cancel"
+            else panel_parts.GENERATE_STYLE.format(
+                normal=accent.name(),
+                hover=accent.lighter(115).name(),
+                down=accent.darker(120).name(),
+                edge=accent.darker(150).name(),
+                radius=max(round(3 * panel_parts.ui_scale()), 2),
+            )
+        )
+        if self.generate_button.styleSheet() != style:
+            self.generate_button.setStyleSheet(style)
+
+    def place_buttons(self):
+        left = self.timeline.labels.width()
+        if self.button_rows.contentsMargins().left() != left:
+            self.button_rows.setContentsMargins(left, 0, 0, 0)
+        size = QtCore.QSize(
+            max(self.buttons_right() - left, 50),
+            round(QtWidgets.QPushButton().sizeHint().height() * panel_parts.GENERATE_TALLER),
+        )
+        if self.generate_button.size() != size:
+            self.generate_button.setFixedSize(size)
+        self.clip_fields.place(left)
+        half = (self.generate_button.width() - 4) // 2
+        for button in (self.reset_button, self.clear_button):
+            if button.width() != half:
+                button.setFixedWidth(half)
+
+    def edit_clip(self, fn, *args):
+        self.with_node(fn, *args)
+        self.refresh()
+
+    def preview_clip(self, pid, frames):
+        """while duration is dragged the timeline shows the clip that long"""
+        canvas = self.timeline.canvas
+        if pid is None:
+            canvas.preview = None
+        else:
+            shown = {"prompts": [dict(p) for p in canvas.prompts], "constraints": []}
+            timeline.resize_prompt(shown, pid, frames)
+            canvas.preview = shown["prompts"]
+        canvas.update()
+
+    def press_generate(self):
+        """generate, or cancel while a generation runs"""
+        if self.node is not None:
+            self.with_node(motion_node.cancel if self.node.evalParm("busy") else motion_node.generate)
+            self.refresh()
+
+    def with_node(self, fn, *args):
+        if self.node is not None:
+            try:
+                fn(self.node, *args)
+            except hou.Error as e:
+                motion_node.set_status(self.node, e.instanceMessage())
+            except rig.NotReady as e:
+                motion_node.set_status(self.node, f"The rig is not ready: {e}. Try again.")
+            self.refresh()
+
+    def edit_pose(self):
+        if self.node is not None:
+            motion_node.edit_pose(self.node)
+            self.refresh()
+
+    def dismiss_error(self):
+        if self.node is not None:
+            motion_node.clear_error(self.node)
+            self.refresh()
+
+    def refresh_timeline(self):
         node = self.node
         try:
             if node is not None:
@@ -827,14 +1026,6 @@ class Panel(panel_parts.KimodoPanel):
                 self.guide_key = key
                 timeline_edit.update_root_path_guide(node)
 
-    def place_buttons(self):
-        super().place_buttons()
-        if getattr(self, "reset_button", None) is not None:
-            half = (self.generate_button.width() - 4) // 2
-            for button in (self.reset_button, self.clear_button):
-                if button.width() != half:
-                    button.setFixedWidth(half)
-
     def reset_selected(self):
         runs = [(c["id"], run) for c, run in self.timeline.canvas.marked_runs()]
         if runs:
@@ -857,7 +1048,8 @@ class Panel(panel_parts.KimodoPanel):
         if self.playbar_callback is not None:
             hou.playbar.removeEventCallback(self.playbar_callback)
             self.playbar_callback = None
-        super().close_panel()
+        self.timer.stop()
+        self.node = None
 
     def edit(self, fn, *args):
         """run a timeline edit, errors go into the node's status"""

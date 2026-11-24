@@ -60,33 +60,58 @@ def stash(node):
     return geo
 
 
-_baking = set()
-_bases = {}
+class _Rig:
+    def __init__(self):
+        self.baking = False
+        self.bases = {}
+        self.writing = False
+
+
+_rigs = {}
+
+
+def _of(node):
+    return _rigs.setdefault(node.sessionId(), _Rig())
+
+
+def bases(node):
+    """this session's bakes by tag, don't modify"""
+    return _of(node).bases
+
+
+def motion_frames(node):
+    return doc.total_frames(doc.loads(node.parm("kimodo_doc").unexpandedString()))
 
 
 def tag_for(node, source):
     """tag of a stash built in this session for a source"""
-    from . import motion_node
+    return f"{source}|{motion_frames(node)}|{SESSION}"
 
-    return f"{source}|{motion_node.motion_frames(node)}|{SESSION}"
+
+@contextlib.contextmanager
+def _evaluating(node):
+    """around an evaluation of the rig from here, never nested"""
+    mine = _of(node)
+    if mine.baking:
+        raise NotReady("the rig is being evaluated")
+    mine.baking = True
+    try:
+        yield
+    finally:
+        mine.baking = False
 
 
 def _cooked(node, name):
-    sid = node.sessionId()
-    if sid in _baking:
-        raise NotReady("the rig is being evaluated")
-    _baking.add(sid)
     inner = node.node(name)
-    try:
-        geo = inner.geometry()
-    except hou.OperationInterrupted:
-        raise Interrupted("converting was interrupted") from None
-    except hou.OperationFailed as e:
-        if "interrupted" in str(e).lower():
+    with _evaluating(node):
+        try:
+            geo = inner.geometry()
+        except hou.OperationInterrupted:
             raise Interrupted("converting was interrupted") from None
-        raise NotReady(f"the bake failed: {e}") from None
-    finally:
-        _baking.discard(sid)
+        except hou.OperationFailed as e:
+            if "interrupted" in str(e).lower():
+                raise Interrupted("converting was interrupted") from None
+            raise NotReady(f"the bake failed: {e}") from None
     if any("interrupted" in error.lower() for error in inner.errors()):
         raise Interrupted("converting was interrupted")
     if geo is None:
@@ -110,15 +135,13 @@ def table(top, frames):
 
 def base(node, source):
     """the bake of the motion rig_result names"""
-    sid, tag = node.sessionId(), tag_for(node, source)
-    kept = _bases.setdefault(sid, {})
+    tag = tag_for(node, source)
+    kept = bases(node)
     if tag in kept:
         return kept[tag]
     top = hou.Geometry(_cooked(node, BAKE))
     top.deletePrims([p for p in top.prims() if p.attribValue("name") != "animation"])
-    from . import motion_node
-
-    frames = motion_node.motion_frames(node)
+    frames = motion_frames(node)
     found = channels(top)
     if not found or any(len(prim.keyFrames()) != frames for prim in found.values()):
         raise NotReady("the bake does not have a key on every frame")
@@ -129,12 +152,12 @@ def base(node, source):
 
 
 def has_base(node, source):
-    return tag_for(node, source) in _bases.get(node.sessionId(), {})
+    return tag_for(node, source) in bases(node)
 
 
 def bake_seconds(node, frames):
     """rough bake time for this many frames"""
-    return frames * 0.012 + (0.0 if _bases.get(node.sessionId()) else 0.9)
+    return frames * 0.012 + (0.0 if bases(node) else 0.9)
 
 
 def frame_keys(node, frames):
@@ -166,21 +189,18 @@ def _with_keys(top, keys):
     return _edited_copy(top, write)
 
 
-_writing = set()
-
-
 @contextlib.contextmanager
 def own_write(node):
     """around a stash write from here, so only houdini's own changes get counted"""
-    _writing.add(node.sessionId())
+    _of(node).writing = True
     try:
         yield
     finally:
-        _writing.discard(node.sessionId())
+        _of(node).writing = False
 
 
 def writing(node):
-    return node.sessionId() in _writing
+    return _of(node).writing
 
 
 def _set_stash(node, top, tag):
@@ -232,9 +252,7 @@ def put_frames(node, source, baked=(), freed=()):
 
 
 def stash_table(node):
-    from . import motion_node
-
-    return table(stash(node), motion_node.motion_frames(node))
+    return table(stash(node), motion_frames(node))
 
 
 _TARGETS = {
@@ -275,16 +293,8 @@ def keys_at(node, frame):
 
 def set_keys(node, frame, values):
     old = stash(node)
-    f = float(frame + 1)
-
-    def write(geo):
-        for prim in geo.prims():
-            name = prim.attribValue("name")
-            if name in values and prim.hasKeyAtFrame(f):
-                prim.setKeyValue(f, values[name])
-
     tag = old.attribValue(TAG) if old.findGlobalAttrib(TAG) is not None else ""
-    _set_stash(node, _edited_copy(old, write), tag)
+    _set_stash(node, _with_keys(old, {frame: values}), tag)
 
 
 CONTROLS_PATH = "/soma.char/Base.rig/"
@@ -308,16 +318,11 @@ def selected_by_selectors():
 
 
 def _evaluate(node, name, frame):
-    sid = node.sessionId()
-    if sid in _baking:
-        raise NotReady("the rig is being evaluated")
-    _baking.add(sid)
-    try:
-        geo = node.node(name).geometryAtFrame(frame + 1)
-    except hou.OperationInterrupted:
-        raise NotReady("the rig's evaluation was interrupted") from None
-    finally:
-        _baking.discard(sid)
+    with _evaluating(node):
+        try:
+            geo = node.node(name).geometryAtFrame(frame + 1)
+        except hou.OperationInterrupted:
+            raise NotReady("the rig's evaluation was interrupted") from None
     if geo is None or not len(geo.points()):
         errors = "; ".join(dict.fromkeys(node.node(name).errors()))
         # houdini is cooking the rig for the viewport right now

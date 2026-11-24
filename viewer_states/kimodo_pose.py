@@ -147,9 +147,17 @@ def _state_class():
         _pelvis = None
 
         def updateHUD(self):
-            unpinned_key = su.hudHotkeyRef(self.hotkeys.toggle_unpinned)
-            labels_key = su.hudHotkeyRef(self.hotkeys.toggle_labels)
-            body_key = su.hudHotkeyRef(self.hotkeys.toggle_body)
+            switches = (
+                (
+                    "unpinned",
+                    "Hide Unpinned Controls",
+                    "Show Unpinned Controls",
+                    self.hotkeys.toggle_unpinned,
+                    self.show_unpinned,
+                ),
+                ("labels", "Hide Pose Labels", "Show Pose Labels", self.hotkeys.toggle_labels, self.show_labels),
+                ("body", "Hide Body", "Show Body", self.hotkeys.toggle_body, self.show_body),
+            )
             self.scene_viewer.hudInfo(
                 template={
                     "title": self._title,
@@ -163,26 +171,13 @@ def _state_class():
                     + [
                         {
                             "type": "group",
-                            "id": "hideunpinnedgroup",
-                            "rows": [{"label": "Hide Unpinned Controls", "key": unpinned_key}],
-                        },
-                        {
-                            "type": "group",
-                            "id": "showunpinnedgroup",
-                            "rows": [{"label": "Show Unpinned Controls", "key": unpinned_key}],
-                        },
-                        {
-                            "type": "group",
-                            "id": "hidelabelsgroup",
-                            "rows": [{"label": "Hide Pose Labels", "key": labels_key}],
-                        },
-                        {
-                            "type": "group",
-                            "id": "showlabelsgroup",
-                            "rows": [{"label": "Show Pose Labels", "key": labels_key}],
-                        },
-                        {"type": "group", "id": "hidebodygroup", "rows": [{"label": "Hide Body", "key": body_key}]},
-                        {"type": "group", "id": "showbodygroup", "rows": [{"label": "Show Body", "key": body_key}]},
+                            "id": f"{verb}{name}group",
+                            "rows": [{"label": label, "key": su.hudHotkeyRef(key)}],
+                        }
+                        for name, hide, show, key, _ in switches
+                        for verb, label in (("hide", hide), ("show", show))
+                    ]
+                    + [
                         {"id": "finish", "label": "End Posing", "key": "Esc"},
                     ],
                 }
@@ -191,12 +186,9 @@ def _state_class():
             self._updateHUDHandleVis()
             self.scene_viewer.hudInfo(
                 values={
-                    "hideunpinnedgroup__visible": self.show_unpinned,
-                    "showunpinnedgroup__visible": not self.show_unpinned,
-                    "hidelabelsgroup__visible": self.show_labels,
-                    "showlabelsgroup__visible": not self.show_labels,
-                    "hidebodygroup__visible": self.show_body,
-                    "showbodygroup__visible": not self.show_body,
+                    f"{verb}{name}group__visible": on == (verb == "hide")
+                    for name, _, _, _, on in switches
+                    for verb in ("hide", "show")
                 }
             )
 
@@ -207,6 +199,17 @@ def _state_class():
                 for d in cb.drawables
                 if isinstance(d, scene_2.SceneShapeOutputDrawable) and d.data_key.endswith(".skel")
             ]
+
+        def _rig_now(self):
+            skel = self._rig_skeletons()[0]
+            return skel, self.scene.getGraphOutputData(skel.output_path, skel.data_key)
+
+        def _stop_drawing(self, name, text):
+            from kimodo_motion import motion_node
+
+            getattr(self, name).show(False)
+            setattr(self, name, None)
+            motion_node.set_status(self.scene_node, text)
 
         def _show_rig_skeleton(self, show):
             for skel in self._rig_skeletons():
@@ -225,8 +228,7 @@ def _state_class():
                 self._show_rig_skeleton(colors is None)
                 if colors is None:
                     return
-                skel = self._rig_skeletons()[0]
-                rig_geo = self.scene.getGraphOutputData(skel.output_path, skel.data_key)
+                skel, rig_geo = self._rig_now()
                 node = self.scene_node
                 key = (
                     frame,
@@ -255,11 +257,9 @@ def _state_class():
                 self._pose_lines.setTransform(skel.drawable.transform() * nearer)
                 self._pose_lines.draw(draw_handle)
             except Exception as e:
-                self._pose_lines.show(False)
-                self._pose_lines = None
                 self._show_rig_skeleton(True)
-                motion_node.set_status(
-                    self.scene_node,
+                self._stop_drawing(
+                    "_pose_lines",
                     f"Kimodo could not draw the pose being edited ({type(e).__name__}: {e}); "
                     "the rig's own skeleton is shown.",
                 )
@@ -271,8 +271,7 @@ def _state_class():
                 return
             try:
                 node = self.scene_node
-                skel = self._rig_skeletons()[0]
-                rig_geo = self.scene.getGraphOutputData(skel.output_path, skel.data_key)
+                skel, rig_geo = self._rig_now()
                 key = (
                     frame,
                     rig_geo.pointFloatAttribValues("P"),
@@ -292,30 +291,25 @@ def _state_class():
                 self._body.setTransform(skel.drawable.transform())
                 self._body.draw(draw_handle)
             except Exception as e:
-                self._body.show(False)
-                self._body = None
-                motion_node.set_status(self.scene_node, f"Kimodo could not draw the body ({type(e).__name__}: {e}).")
+                self._stop_drawing("_body", f"Kimodo could not draw the body ({type(e).__name__}: {e}).")
 
         def _draw_mark(self, draw_handle, frame):
             from kimodo_motion import motion_node
 
             node = self.scene_node
-            if self._mark_lines is None or frame not in motion_node._headed(node) or not self._rig_skeletons():
+            if self._mark_lines is None or frame not in motion_node.headed(node) or not self._rig_skeletons():
                 return
             try:
                 self._make_mark(draw_handle, frame)
             except Exception as e:
-                self._mark_lines.show(False)
-                self._mark_lines = None
-                motion_node.set_status(node, f"Kimodo could not draw the heading's mark ({type(e).__name__}: {e}).")
+                self._stop_drawing("_mark_lines", f"Kimodo could not draw the heading's mark ({type(e).__name__}: {e}).")
 
         def _make_mark(self, draw_handle, frame):
             from kimodo_motion import motion_node, rig
 
             node = self.scene_node
-            skel = self._rig_skeletons()[0]
-            rig_geo = self.scene.getGraphOutputData(skel.output_path, skel.data_key)
-            color = motion_node._marker_color(frame, motion_node.changed_frames(node))
+            skel, rig_geo = self._rig_now()
+            color = motion_node.marker_color(frame, motion_node.changed_frames(node))
             key = (frame, rig_geo.pointFloatAttribValues("P"), rig_geo.pointFloatAttribValues("transform"), color)
             if key != self._mark_key:
                 self._mark_key = key
@@ -338,13 +332,13 @@ def _state_class():
         def _draw_own(self, kwargs):
             if self.scene_node is None:
                 return
-            current = int(round(hou.frame())) - 1
+            from kimodo_motion import motion_node
+
+            current = motion_node.current_frame()
             self._draw_pose(kwargs["draw_handle"], current)
             self._draw_mark(kwargs["draw_handle"], current)
             self._draw_body(kwargs["draw_handle"], current)
             try:
-                from kimodo_motion import motion_node
-
                 label = motion_node.constraint_label(self.scene_node, current)
                 title = f"{STATE_LABEL}: {label}" if label else STATE_LABEL
                 if title != self._title:
@@ -495,16 +489,12 @@ def _state_class():
             if hou.hotkeys.isKeyMatch(key, self.hotkeys.toggle_unpinned):
                 self._toggle_unpinned()
                 return True
-            if hou.hotkeys.isKeyMatch(key, self.hotkeys.toggle_labels):
-                self.show_labels = not self.show_labels
-                self.updateHUD()
-                self.scene_viewer.curViewport().draw()
-                return True
-            if hou.hotkeys.isKeyMatch(key, self.hotkeys.toggle_body):
-                self.show_body = not self.show_body
-                self.updateHUD()
-                self.scene_viewer.curViewport().draw()
-                return True
+            for name, symbol in (("show_labels", self.hotkeys.toggle_labels), ("show_body", self.hotkeys.toggle_body)):
+                if hou.hotkeys.isKeyMatch(key, symbol):
+                    setattr(self, name, not getattr(self, name))
+                    self.updateHUD()
+                    self.scene_viewer.curViewport().draw()
+                    return True
             return False
 
         def onKeyTransitEvent(self, kwargs):
