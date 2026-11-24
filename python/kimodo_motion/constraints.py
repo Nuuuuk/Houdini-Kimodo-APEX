@@ -4,9 +4,10 @@ from collections import namedtuple
 
 import numpy as np
 
-from .skeleton import NUM_JOINTS, fk
+from .skeleton import JOINT_NAMES, NUM_JOINTS, fk
 
-Pose = namedtuple("Pose", "local_rots root_position root_2d", defaults=(None,))
+Pose = namedtuple("Pose", "local_rots root_position root_2d heading", defaults=(None, None))
+_RIGHT_HIP, _LEFT_HIP = JOINT_NAMES.index("RightLeg"), JOINT_NAMES.index("LeftLeg")
 
 SOMA30_IN_77 = (
     0,
@@ -53,6 +54,30 @@ def motion_pose_source(motion):
     return pose
 
 
+def heading_of(pose):
+    """(cos, sin) heading of a pose"""
+    if pose.heading is not None:
+        return tuple(float(v) for v in pose.heading)
+    positions = fk(pose.local_rots, pose.root_position)[0]
+    across = positions[_RIGHT_HIP] - positions[_LEFT_HIP]
+    angle = np.arctan2(across[2], -across[0])
+    return float(np.cos(angle)), float(np.sin(angle))
+
+
+def first_heading_angle(cjson):
+    """heading the constraints hold on the first frame"""
+    for e in cjson:
+        if e["type"] == "root2d" and "global_root_heading" in e and 0 in e["frame_indices"]:
+            c, s = e["global_root_heading"][e["frame_indices"].index(0)]
+            return float(np.arctan2(s, c))
+    for e in cjson:
+        if e["type"] in POSE_TYPES and 0 in e["frame_indices"]:
+            i = e["frame_indices"].index(0)
+            c, s = heading_of(Pose(axis_angle_to_matrix(np.array(e["local_joints_rot"][i])), np.array(e["root_positions"][i])))
+            return float(np.arctan2(s, c))
+    return None
+
+
 def same_pose(a, b, position_tol=1e-4, angle_tol=1e-3):
     (pa, wa), (pb, wb) = fk(a.local_rots, a.root_position), fk(b.local_rots, b.root_position)
     if np.abs(pa - pb).max() > position_tol:
@@ -80,9 +105,20 @@ def to_kimodo_json(constraints, pose_source):
             entry["smooth_root_2d"] = [
                 list(map(float, root[i, [0, 2]] if p.root_2d is None else p.root_2d)) for i, p in enumerate(poses)
             ]
+            if c.get("heading"):
+                entry["global_root_heading"] = [list(heading_of(p)) for p in poses]
         else:
             entry["smooth_root_2d"] = root[:, [0, 2]].tolist()
         out.append(entry)
+    return out
+
+
+def frame_entries(cjson):
+    """{(type, frame): what the json sends for it}"""
+    out = {}
+    for entry in cjson:
+        for i, frame in enumerate(entry["frame_indices"]):
+            out[(entry["type"], frame)] = {k: v[i] for k, v in entry.items() if k not in ("type", "frame_indices")}
     return out
 
 
@@ -98,7 +134,13 @@ def from_kimodo_json(data):
         constraints.append({"id": cid, "type": ctype, "frames": sorted(set(frames))})
         xz = np.asarray(entry["smooth_root_2d"], dtype=np.float64).reshape(len(frames), 2)
         if ctype == "root2d":
-            poses[cid] = {f: Pose(None, np.array([x, np.nan, z])) for f, (x, z) in zip(frames, xz)}
+            headings = entry.get("global_root_heading") or [None] * len(frames)
+            if entry.get("global_root_heading"):
+                constraints[-1]["heading"] = True
+            poses[cid] = {
+                f: Pose(None, np.array([x, np.nan, z]), None, None if h is None else (float(h[0]), float(h[1])))
+                for f, (x, z), h in zip(frames, xz, headings)
+            }
             continue
         rots = _to_77(axis_angle_to_matrix(np.asarray(entry["local_joints_rot"], dtype=np.float64)))
         root = np.asarray(entry["root_positions"], dtype=np.float64).reshape(len(frames), 3)

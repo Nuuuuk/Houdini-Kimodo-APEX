@@ -12,8 +12,29 @@ def _same_path(a, b):
         return False
 
 
+# workaround for nv-tlabs/kimodo issue #57, drop it once that's fixed
+def patch_empty_constraint_sets():
+    try:
+        from kimodo.motion_rep.conditioning import ConditionWriters
+    except ImportError:
+        return
+    if getattr(ConditionWriters.gather, "_kimodo_patched", False):
+        return
+    orig_gather = ConditionWriters.gather
+
+    def gather(self, fname):
+        entries = self.index_dict.get(fname) if hasattr(self.index_dict, "get") else None
+        if entries and all(len(e) == 0 for e in entries):
+            return None
+        return orig_gather(self, fname)
+
+    gather._kimodo_patched = True
+    ConditionWriters.gather = gather
+
+
 def apply(llama_dir=None, template=True):
     """install the patches, template=False skips patch 2"""
+    patch_empty_constraint_sets()
     llama_dir = llama_dir or os.environ.get("KIMODO_LLAMA_DIR")
     if not llama_dir or not os.path.isfile(os.path.join(llama_dir, "config.json")):
         raise RuntimeError(f"KIMODO_LLAMA_DIR does not point at a Llama-3 model folder: {llama_dir!r}")

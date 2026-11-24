@@ -1,13 +1,13 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <pythonPanelDocument>
   <interface name="kimodo::motion" label="Kimodo Motion" icon="SOP_kinefx-rigpose" showNetworkNavigationBar="false" help_url="">
-    <script><![CDATA[from kimodo_motion import panel_parts as kimodo_panel
+    <script><![CDATA[from kimodo_motion import timeline_ui as kimodo_panel
 
 ui = None
 
 def onCreateInterface():
     global ui
-    ui = kimodo_panel.KimodoPanel()
+    ui = kimodo_panel.Panel()
     return ui
 
 def onDestroyInterface():

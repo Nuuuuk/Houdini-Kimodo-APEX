@@ -5,7 +5,7 @@ import time
 import hou
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from . import doc, motion_node, rig
+from . import doc, motion_node, rig, timeline, timeline_edit
 
 TRACKS = ("Prompts", "Full-Body", "2D Root", "Left Hand", "Right Hand", "Left Foot", "Right Foot")
 TRACK_TYPES = ("fullbody", "root2d", "left-hand", "right-hand", "left-foot", "right-foot")
@@ -20,6 +20,7 @@ STAGE_COLORS = {
     "canceled": "#8a8a8a",
     "error": "#d9534f",
 }
+HINT_COLOR = "#a3a3a3"
 
 
 def paste_entries(ctype, frame):
@@ -32,18 +33,17 @@ def paste_entries(ctype, frame):
     return [(f"Paste Pose at Frame {n}", False)]
 
 
-def houdini_tooltip(widget, title, text, hotkey=""):
-    widget.setProperty("tooltip_text", f"{title}: {text}" + (f" Hotkey: {hotkey}." if hotkey else ""))
-    if not hou.isUIAvailable():
-        widget.setToolTip(text)
-        return None
-    tip = hou.qt.ToolTip()
-    tip.setTitle(title)
-    tip.setText(text)
-    if hotkey:
-        tip.setHotkey(hotkey)
-    tip.setTargetWidget(widget)
-    return tip
+class Look:
+    def __init__(self, palette):
+        base = palette.color(QtGui.QPalette.Base)
+        self.text = palette.color(QtGui.QPalette.Text)
+        self.dim = QtGui.QColor(self.text)
+        self.dim.setAlpha(150)
+        self.row, self.row_alt = base.darker(140), base.darker(127)
+        self.ruler, self.header = base.darker(170), base.darker(112)
+        self.line = base.darker(240)
+        self.grid = QtGui.QColor(255, 255, 255, 13)
+        self.beyond = QtGui.QColor(0, 0, 0, 95)
 
 
 class Metrics:
@@ -80,10 +80,15 @@ class TrackLabels(FontSized):
 
     def paintEvent(self, event):
         p = QtGui.QPainter(self)
-        p.setPen(self.palette().color(QtGui.QPalette.Text))
+        look = Look(self.palette())
+        width, ruler_h, row_h = self.width() - 1, self.m.ruler_h, self.m.row_h
+        p.fillRect(self.rect(), look.line)
+        p.fillRect(0, 0, width, ruler_h - 1, look.ruler)
+        p.setPen(look.text)
         for i, name in enumerate(TRACKS):
+            p.fillRect(0, ruler_h + i * row_h, width, row_h - 1, look.header)
             p.drawText(
-                QtCore.QRect(6, self.m.ruler_h + i * self.m.row_h, self.m.label_w - 8, self.m.row_h),
+                QtCore.QRect(6, ruler_h + i * row_h, self.m.label_w - 8, row_h - 1),
                 QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter,
                 name,
             )
@@ -91,9 +96,6 @@ class TrackLabels(FontSized):
 
 
 class TimelineCanvas(FontSized):
-    add_requested = QtCore.Signal(str)
-    delete_requested = QtCore.Signal(str)
-    type_requested = QtCore.Signal(str, str)
     frame_requested = QtCore.Signal(int)
     edit_requested = QtCore.Signal()
     copy_requested = QtCore.Signal(int)
@@ -101,6 +103,7 @@ class TimelineCanvas(FontSized):
 
     def __init__(self):
         self.prompts, self.constraints, self.total, self.frame = [], [], 5 * doc.FPS, 0
+        self.changed = set()
         super().__init__()
 
     def scale(self):
@@ -109,63 +112,6 @@ class TimelineCanvas(FontSized):
     def frame_x(self, frame):
         """middle of the frame's cell"""
         return (frame + 0.5) * self.scale()
-
-    def constraint_at(self, pos):
-        row = (pos.y() - self.m.ruler_h) // self.m.row_h - 1
-        if not 0 <= row < len(TRACK_TYPES):
-            return None, None
-        ctype = TRACK_TYPES[row]
-        reach = max(self.m.row_h // 2, 6)
-        for c in self.constraints:
-            if c["type"] == ctype and any(abs(pos.x() - self.frame_x(f)) <= reach for f in c["frames"]):
-                return c, ctype
-        return None, ctype
-
-    def track_menu(self, constraint, ctype, frame):
-        menu, actions = QtWidgets.QMenu(self), {}
-        if constraint is not None:
-            actions[menu.addAction("Copy Pose")] = lambda: self.copy_requested.emit(frame)
-        for text, keep_root in paste_entries(ctype, self.frame):
-            action = menu.addAction(text)
-            action.setEnabled(motion_node.has_copied_pose())
-            actions[action] = lambda keep_root=keep_root: self.paste_requested.emit(ctype, keep_root)
-        if constraint is not None:
-            menu.addSeparator()
-            actions[menu.addAction("Delete")] = lambda: self.delete_requested.emit(constraint["id"])
-            menu.addSeparator()
-            for i, t in enumerate(TRACK_TYPES):
-                if t != constraint["type"]:
-                    actions[menu.addAction(f"Change to {TRACKS[i + 1]}")] = lambda t=t: self.type_requested.emit(
-                        constraint["id"], t
-                    )
-        return menu, actions
-
-    def nearest_frame(self, constraint, event):
-        x = event.position().x() / self.scale() - 0.5
-        return min(constraint["frames"], key=lambda f: abs(f - x))
-
-    def mousePressEvent(self, event):
-        c, ctype = self.constraint_at(event.position().toPoint())
-        if ctype is None:
-            return super().mousePressEvent(event)
-        if event.button() == QtCore.Qt.RightButton:
-            menu, actions = self.track_menu(c, ctype, self.nearest_frame(c, event) if c is not None else None)
-            chosen = menu.exec(event.globalPosition().toPoint())
-            if chosen in actions:
-                actions[chosen]()
-        elif event.button() == QtCore.Qt.LeftButton:
-            if c is not None:
-                self.frame_requested.emit(self.nearest_frame(c, event))
-            else:
-                self.add_requested.emit(ctype)
-
-    def mouseDoubleClickEvent(self, event):
-        c, _ = self.constraint_at(event.position().toPoint())
-        if c is not None and event.button() == QtCore.Qt.LeftButton:
-            self.frame_requested.emit(self.nearest_frame(c, event))
-            self.edit_requested.emit()
-        else:
-            super().mouseDoubleClickEvent(event)
 
     def apply_metrics(self):
         super().apply_metrics()
@@ -180,64 +126,14 @@ class TimelineCanvas(FontSized):
             self.setMinimumWidth(total * self.m.px_per_frame)
             self.update()
 
-    def paintEvent(self, event):
-        p = QtGui.QPainter(self)
-        pal = self.palette()
-        ruler_h, row_h = self.m.ruler_h, self.m.row_h
-        scale = self.scale()
-        text = pal.color(QtGui.QPalette.Text)
-        for i in range(len(TRACKS)):
-            role = QtGui.QPalette.AlternateBase if i % 2 else QtGui.QPalette.Base
-            p.fillRect(0, ruler_h + i * row_h, self.width(), row_h - 1, pal.color(role))
-        p.setPen(text)
-        for second in range(self.total // doc.FPS + 1):
-            x = int(self.frame_x(second * doc.FPS))
-            p.drawLine(x, ruler_h - 6, x, ruler_h - 1)
-            p.drawText(x + 3, ruler_h - 6, f"{second}s")
-        for pr in self.prompts:
-            x0, x1 = int(pr["start_frame"] * scale), int(pr["end_frame"] * scale)
-            rect = QtCore.QRect(x0 + 1, ruler_h + 2, x1 - x0 - 2, row_h - 5)
-            p.fillRect(rect, QtGui.QColor(70, 120, 200))
-            p.setPen(QtGui.QColor(255, 255, 255))
-            label = p.fontMetrics().elidedText(pr["text"], QtCore.Qt.ElideRight, rect.width() - 8)
-            p.drawText(rect.adjusted(4, 0, -4, 0), QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter, label)
-        p.setRenderHint(QtGui.QPainter.Antialiasing)
-        size = max(row_h // 2 - 2, 4)
-        for c in self.constraints:
-            y = ruler_h + (TRACK_TYPES.index(c["type"]) + 1) * row_h + row_h // 2
-            frames = c["frames"]
-            color = QtGui.QColor(*(motion_node.AUTO_MARKER_RGB if c.get("auto") else motion_node.MARKER_RGB))
-            p.setPen(QtCore.Qt.NoPen)
-            p.setBrush(color)
-            if len(frames) > 1 and frames[-1] - frames[0] == len(frames) - 1:
-                p.drawRoundedRect(QtCore.QRectF(frames[0] * scale, y - size / 2, (len(frames)) * scale, size), 2, 2)
-                continue
-            for f in frames:
-                cx = self.frame_x(f)
-                p.drawPolygon(
-                    QtGui.QPolygonF(
-                        [
-                            QtCore.QPointF(cx, y - size),
-                            QtCore.QPointF(cx + size, y),
-                            QtCore.QPointF(cx, y + size),
-                            QtCore.QPointF(cx - size, y),
-                        ]
-                    )
-                )
-        p.setRenderHint(QtGui.QPainter.Antialiasing, False)
-        x = int(self.frame_x(self.frame))
-        p.setPen(QtGui.QPen(QtGui.QColor(230, 90, 60), 2))
-        p.drawLine(x, 0, x, self.height())
-        p.end()
-
 
 class TimelineArea(QtWidgets.QWidget):
-    def __init__(self):
+    def __init__(self, canvas=None):
         super().__init__()
         row = QtWidgets.QHBoxLayout(self)
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(0)
-        self.canvas = TimelineCanvas()
+        self.canvas = canvas or TimelineCanvas()
         scroll = QtWidgets.QScrollArea()
         scroll.setWidget(self.canvas)
         scroll.setWidgetResizable(True)
@@ -245,6 +141,7 @@ class TimelineArea(QtWidgets.QWidget):
         scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
         scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
         self.labels, self.scroll = TrackLabels(), scroll
+        scroll.horizontalScrollBar().valueChanged.connect(lambda _: self.canvas.update())
         row.addWidget(self.labels, 0, QtCore.Qt.AlignTop)
         row.addWidget(scroll, 1)
 
@@ -256,12 +153,30 @@ class TimelineArea(QtWidgets.QWidget):
         return self.minimumSizeHint()
 
 
+class HintLabel(QtWidgets.QLabel):
+    """always two lines high so the panel doesn't jump"""
+
+    def __init__(self):
+        super().__init__("")
+        self.setWordWrap(True)
+        self.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
+        self.fit()
+
+    def fit(self):
+        self.setMinimumHeight(2 * self.fontMetrics().lineSpacing())
+
+    def changeEvent(self, event):
+        if event.type() in (QtCore.QEvent.FontChange, QtCore.QEvent.StyleChange):
+            self.fit()
+        super().changeEvent(event)
+
+
 class StatusWidget(QtWidgets.QFrame):
     dismissed = QtCore.Signal()
 
     def __init__(self):
         super().__init__()
-        self.setFrameShape(QtWidgets.QFrame.StyledPanel)
+        self.setFrameShape(QtWidgets.QFrame.NoFrame)
         col = QtWidgets.QVBoxLayout(self)
         col.setContentsMargins(8, 6, 8, 6)
         col.setSpacing(4)
@@ -275,9 +190,8 @@ class StatusWidget(QtWidgets.QFrame):
         head.addWidget(self.text, 1)
         head.addWidget(self.elapsed, 0, QtCore.Qt.AlignTop)
         col.addLayout(head)
-        self.hint = QtWidgets.QLabel("")
-        self.hint.setWordWrap(True)
-        self.hint.setStyleSheet(f"color: {STAGE_COLORS['idle']};")
+        self.hint = HintLabel()
+        self.hint.setStyleSheet(f"color: {HINT_COLOR};")
         col.addWidget(self.hint)
         self.bar = QtWidgets.QProgressBar()
         self.bar.setTextVisible(False)
@@ -294,7 +208,6 @@ class StatusWidget(QtWidgets.QFrame):
         self.log_link = QtWidgets.QLabel()
         self.log_link.setOpenExternalLinks(True)
         dismiss = QtWidgets.QPushButton("Dismiss")
-        self.tips = [houdini_tooltip(dismiss, "Dismiss", "Clear the warning or error on the node.")]
         dismiss.clicked.connect(self.dismissed)
         actions.addWidget(self.log_link, 1)
         actions.addWidget(dismiss, 0)
@@ -328,7 +241,6 @@ class StatusWidget(QtWidgets.QFrame):
         if shown == self.shown:
             return
         self.shown = shown
-        self.text.setToolTip("")
         self.dot.setStyleSheet(f"background: {STAGE_COLORS.get(stage, '#8a8a8a')}; border-radius: 5px;")
         self.text.setText(st["text"])
         self.elapsed.setText(elapsed)
@@ -347,21 +259,135 @@ class StatusWidget(QtWidgets.QFrame):
             self.log_link.setText(f'<a href="{url}">Open service.log</a>' if st["log"] else "")
 
 
+MENU_RIGHT = 310
+DIVIDER_SPACE = 8
+GENERATE_TALLER = 1.3
+ACCENT_RGB = (70, 120, 200)
+GENERATE_STYLE = (
+    "QPushButton {{ background-color: {normal}; color: white; border: 1px solid {edge}; border-radius: {radius}px; }}"
+    " QPushButton:hover {{ background-color: {hover}; }} QPushButton:pressed {{ background-color: {down}; }}"
+)
+
+
+def ui_scale():
+    return hou.ui.globalScaleFactor() if hou.isUIAvailable() else 1.0
+
+
+class ClipFields(QtWidgets.QWidget):
+    LABEL_X = 6
+
+    def __init__(self):
+        super().__init__()
+        self.node = None
+        self.run = None
+        self.preview = None
+        self.prompt_label, self.duration_label = QtWidgets.QLabel("Prompt"), QtWidgets.QLabel("Duration (s)")
+        self.prompt, self.duration = QtWidgets.QLineEdit(), QtWidgets.QLineEdit()
+        self.slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.slider.setRange(doc.MIN_PROMPT_FRAMES, doc.MAX_PROMPT_FRAMES)
+        rows = QtWidgets.QVBoxLayout(self)
+        rows.setContentsMargins(self.LABEL_X, 0, self.LABEL_X, 0)
+        rows.setSpacing(4)
+        for widgets in ((self.prompt_label, self.prompt), (self.duration_label, self.duration, self.slider)):
+            row = QtWidgets.QHBoxLayout()
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(4)
+            for w in widgets:
+                row.addWidget(w, 1 if w in (self.prompt, self.slider) else 0)
+            rows.addLayout(row)
+        self.prompt.editingFinished.connect(self.commit_prompt)
+        self.duration.editingFinished.connect(self.commit_duration)
+        self.slider.valueChanged.connect(self.slid)
+        self.slider.sliderReleased.connect(self.slide_ended)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed)
+
+    def place(self, left):
+        label = max(left - self.LABEL_X - 4, 10)
+        number = max(round(self.duration.fontMetrics().horizontalAdvance("00.000") * 1.6), 40)
+        for w, size in ((self.prompt_label, label), (self.duration_label, label), (self.duration, number)):
+            if w.width() != size:
+                w.setFixedWidth(size)
+
+    def clip(self):
+        if self.node is None:
+            return None
+        d = motion_node.read_doc(self.node)
+        return d["prompts"][motion_node.selected_prompt(self.node, d)] if d["prompts"] else None
+
+    def refresh(self, node):
+        """show the selected clip unless a field is being typed in or dragged"""
+        self.node = node
+        clip = self.clip()
+        self.setEnabled(clip is not None)
+        if clip is None:
+            return
+        text, frames = clip["text"], clip["end_frame"] - clip["start_frame"]
+        if not self.prompt.isModified() and self.prompt.text() != text:
+            self.prompt.setText(text)
+            self.prompt.setCursorPosition(0)
+        if (
+            not self.duration.isModified()
+            and not self.slider.isSliderDown()
+            and self.duration.text() != f"{frames / doc.FPS:g}"
+        ):
+            self.duration.setText(f"{frames / doc.FPS:g}")
+        if not self.slider.isSliderDown() and self.slider.value() != frames:
+            self.slider.blockSignals(True)
+            self.slider.setValue(frames)
+            self.slider.blockSignals(False)
+
+    def commit_prompt(self):
+        self.prompt.setModified(False)
+        clip, text = self.clip(), self.prompt.text().strip()
+        if clip is not None and text and text != clip["text"] and self.run is not None:
+            self.run(timeline_edit.set_prompt_text, clip["id"], text)
+
+    def commit_duration(self):
+        self.duration.setModified(False)
+        clip = self.clip()
+        if clip is None:
+            return
+        try:
+            frames = timeline.clamp_prompt_frames(round(float(self.duration.text()) * doc.FPS))
+        except ValueError:
+            frames = clip["end_frame"] - clip["start_frame"]
+        self.resize_clip(clip, frames)
+        self.duration.setText(f"{frames / doc.FPS:g}")
+
+    def resize_clip(self, clip, frames):
+        if frames != clip["end_frame"] - clip["start_frame"] and self.run is not None:
+            self.run(timeline_edit.resize_prompt, clip["id"], frames)
+
+    def slid(self, frames):
+        clip = self.clip()
+        if clip is None:
+            return
+        self.duration.setText(f"{frames / doc.FPS:g}")
+        if self.slider.isSliderDown():
+            if self.preview is not None:
+                self.preview(clip["id"], frames)
+        else:
+            self.resize_clip(clip, frames)
+
+    def slide_ended(self):
+        clip = self.clip()
+        if self.preview is not None:
+            self.preview(None, None)
+        if clip is not None:
+            self.resize_clip(clip, self.slider.value())
+
+
 class KimodoPanel(QtWidgets.QWidget):
-    def __init__(self, parm_editor_factory=None):
+    def __init__(self, parm_editor_factory=None, canvas=None):
         super().__init__()
         self.node = None
         self.refreshing = False
+        self.hover_hint = ""
         self.doc_text, self.doc = None, None
         self.parm_editor = None
         self.parm_editor_factory = parm_editor_factory or (lambda node: hou.qt.ParmDialog(node, compact=True))
-        self.timeline = TimelineArea()
+        self.timeline = TimelineArea(canvas)
         canvas = self.timeline.canvas
-        canvas.add_requested.connect(
-            lambda ctype: self.with_node(motion_node.add_constraint, ctype, int(round(hou.frame())) - 1)
-        )
-        canvas.delete_requested.connect(lambda cid: self.with_node(motion_node.delete_constraint, cid))
-        canvas.type_requested.connect(lambda cid, ctype: self.with_node(motion_node.set_constraint_type, cid, ctype))
         canvas.frame_requested.connect(lambda frame: hou.setFrame(frame + 1))
         canvas.edit_requested.connect(self.edit_pose)
         canvas.copy_requested.connect(lambda frame: self.with_node(motion_node.copy_pose, frame))
@@ -372,6 +398,24 @@ class KimodoPanel(QtWidgets.QWidget):
         )
         self.status = StatusWidget()
         self.status.dismissed.connect(self.dismiss_error)
+        self.buttons = QtWidgets.QWidget()
+        self.button_rows = QtWidgets.QVBoxLayout(self.buttons)
+        self.button_rows.setSpacing(4)
+        self.generate_button = QtWidgets.QPushButton("Generate")
+        self.generate_button.clicked.connect(self.press_generate)
+        self.button_rows.addWidget(self.generate_button, 0, QtCore.Qt.AlignLeft)
+        self.buttons.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed)
+        self.clip_fields = ClipFields()
+        self.divider = QtWidgets.QFrame()
+        self.divider.setFrameShape(QtWidgets.QFrame.HLine)
+        self.divider.setFrameShadow(QtWidgets.QFrame.Sunken)
+        self.divider_box = QtWidgets.QWidget()
+        around = QtWidgets.QVBoxLayout(self.divider_box)
+        around.setContentsMargins(0, DIVIDER_SPACE, 0, DIVIDER_SPACE)
+        around.addWidget(self.divider)
+        self.divider_box.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed)
+        self.clip_fields.run = self.edit_clip
+        self.clip_fields.preview = self.preview_clip
         fixed = QtWidgets.QSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed)
         self.timeline.setSizePolicy(fixed)
         self.status.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Maximum)
@@ -380,7 +424,12 @@ class KimodoPanel(QtWidgets.QWidget):
         self.stack.setSpacing(4)
         self.stack.addWidget(self.timeline, 0)
         self.stack.addWidget(self.status, 0)
+        self.stack.addWidget(self.clip_fields, 0)
+        self.stack.addWidget(self.buttons, 0)
+        self.stack.addWidget(self.divider_box, 0)
         self.stack.addStretch(1)
+        self.style_generate()
+        self.place_buttons()
         self.timer = QtCore.QTimer(self)
         self.timer.setInterval(200)
         self.timer.timeout.connect(self.tick)
@@ -401,7 +450,7 @@ class KimodoPanel(QtWidgets.QWidget):
         if node is not None:
             if self.parm_editor is None:
                 self.parm_editor = self.parm_editor_factory(node)
-                self.stack.takeAt(2)
+                self.stack.takeAt(self.stack.count() - 1)
                 self.stack.addWidget(self.parm_editor, 1)
             else:
                 self.parm_editor.setNode(node)
@@ -417,16 +466,81 @@ class KimodoPanel(QtWidgets.QWidget):
             if self.node is None:
                 return
             self.status.show_status(motion_node.get_status(self.node))
-            self.status.show_hint(motion_node.pose_hint(self.node))
+            self.generate_button.setText("Cancel" if self.node.evalParm("busy") else "Generate")
+            self.style_generate()
+            self.clip_fields.refresh(self.node)
+            self.place_buttons()
+            self.status.show_hint(self.hover_hint or motion_node.pose_hint(self.node))
             text = self.node.parm("kimodo_doc").unexpandedString()
             if text != self.doc_text:
                 self.doc_text, self.doc = text, motion_node.read_doc(self.node)
             d = self.doc
-            self.timeline.canvas.set_state(d["prompts"], int(round(hou.frame())) - 1, d["constraints"])
+            canvas = self.timeline.canvas
+            changed = motion_node.changed_keyframes(self.node)
+            if changed != canvas.changed:
+                canvas.changed = changed
+                canvas.update()
+            canvas.set_state(d["prompts"], int(round(hou.frame())) - 1, d["constraints"])
         except (hou.ObjectWasDeleted, doc.DocError):
             self.node = None
         finally:
             self.refreshing = False
+
+    def buttons_right(self):
+        """where the parm editor's menus end"""
+        editor = self.parm_editor.mapTo(self, QtCore.QPoint(0, 0)).x() if self.parm_editor is not None else 0
+        return editor + round(MENU_RIGHT * ui_scale())
+
+    def style_generate(self):
+        """generate in the clips' blue, plain while it reads cancel"""
+        accent = QtGui.QColor(*ACCENT_RGB)
+        style = (
+            ""
+            if self.generate_button.text() == "Cancel"
+            else GENERATE_STYLE.format(
+                normal=accent.name(),
+                hover=accent.lighter(115).name(),
+                down=accent.darker(120).name(),
+                edge=accent.darker(150).name(),
+                radius=max(round(3 * ui_scale()), 2),
+            )
+        )
+        if self.generate_button.styleSheet() != style:
+            self.generate_button.setStyleSheet(style)
+
+    def place_buttons(self):
+        left = self.timeline.labels.width()
+        if self.button_rows.contentsMargins().left() != left:
+            self.button_rows.setContentsMargins(left, 0, 0, 0)
+        size = QtCore.QSize(
+            max(self.buttons_right() - left, 50), round(QtWidgets.QPushButton().sizeHint().height() * GENERATE_TALLER)
+        )
+        if self.generate_button.size() != size:
+            self.generate_button.setFixedSize(size)
+        self.clip_fields.place(left)
+
+    def edit_clip(self, fn, *args):
+        self.with_node(fn, *args)
+        self.refresh()
+
+    def preview_clip(self, pid, frames):
+        """while duration is dragged the timeline shows the clip that long"""
+        canvas = self.timeline.canvas
+        if not hasattr(canvas, "preview"):
+            return
+        if pid is None:
+            canvas.preview = None
+        else:
+            shown = {"prompts": [dict(p) for p in canvas.prompts], "constraints": []}
+            timeline.resize_prompt(shown, pid, frames)
+            canvas.preview = shown["prompts"]
+        canvas.update()
+
+    def press_generate(self):
+        """generate, or cancel while a generation runs"""
+        if self.node is not None:
+            self.with_node(motion_node.cancel if self.node.evalParm("busy") else motion_node.generate)
+            self.refresh()
 
     def with_node(self, fn, *args):
         if self.node is not None:

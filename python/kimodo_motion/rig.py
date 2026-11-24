@@ -1,5 +1,6 @@
 """the apex constraint rig inside the asset: baking and reading poses."""
 
+import contextlib
 import uuid
 
 import hou
@@ -65,7 +66,9 @@ _bases = {}
 
 def tag_for(node, source):
     """tag of a stash built in this session for a source"""
-    return f"{source}|{node.evalParm('duration'):g}|{SESSION}"
+    from . import motion_node
+
+    return f"{source}|{motion_node.motion_frames(node)}|{SESSION}"
 
 
 def _cooked(node, name):
@@ -113,7 +116,9 @@ def base(node, source):
         return kept[tag]
     top = hou.Geometry(_cooked(node, BAKE))
     top.deletePrims([p for p in top.prims() if p.attribValue("name") != "animation"])
-    frames = int(round(node.evalParm("duration") * doc.FPS))
+    from . import motion_node
+
+    frames = motion_node.motion_frames(node)
     found = channels(top)
     if not found or any(len(prim.keyFrames()) != frames for prim in found.values()):
         raise NotReady("the bake does not have a key on every frame")
@@ -161,11 +166,33 @@ def _with_keys(top, keys):
     return _edited_copy(top, write)
 
 
+_writing = set()
+
+
+@contextlib.contextmanager
+def own_write(node):
+    """around a stash write from here, so only houdini's own changes get counted"""
+    _writing.add(node.sessionId())
+    try:
+        yield
+    finally:
+        _writing.discard(node.sessionId())
+
+
+def writing(node):
+    return node.sessionId() in _writing
+
+
 def _set_stash(node, top, tag):
     if top.findGlobalAttrib(TAG) is None:
         top.addAttrib(hou.attribType.Global, TAG, "")
     top.setGlobalAttribValue(TAG, tag)
-    node.parm(STASH).set(top)
+    with own_write(node):
+        node.parm(STASH).set(top)
+
+
+def relabel(node, tag):
+    _set_stash(node, hou.Geometry(stash(node)), tag)
 
 
 def stash_tag(node):
@@ -205,7 +232,9 @@ def put_frames(node, source, baked=(), freed=()):
 
 
 def stash_table(node):
-    return table(stash(node), int(round(node.evalParm("duration") * doc.FPS)))
+    from . import motion_node
+
+    return table(stash(node), motion_node.motion_frames(node))
 
 
 _TARGETS = {
@@ -226,11 +255,7 @@ def pinned_controls(ctypes):
         return None
     names = set()
     for ctype in ctypes:
-        names |= (
-            {skeleton.ROOT_CONTROL}
-            if ctype == "root2d"
-            else {_TARGETS[ctype], skeleton.ROOT_CONTROL, skeleton.PELVIS_CONTROL}
-        )
+        names |= ({skeleton.ROOT_CONTROL} if ctype == "root2d" else {_TARGETS[ctype], skeleton.ROOT_CONTROL, skeleton.COG_CONTROL})
     return names
 
 
@@ -267,7 +292,19 @@ CONTROLS_PATH = "/soma.char/Base.rig/"
 
 def pose_controls():
     limbs = [f"{limb}{part}_ik" for limb in skeleton.LIMBS for part in ("Target", "Polevec")]
-    return {skeleton.ROOT_CONTROL, skeleton.PELVIS_CONTROL, *skeleton.FK_CONTROLS, *limbs}
+    return {
+        skeleton.ROOT_CONTROL,
+        skeleton.COG_CONTROL,
+        skeleton.PELVIS_CONTROL,
+        *skeleton.FK_CONTROLS,
+        *limbs,
+        *skeleton.FINGER_SELECTORS,
+    }
+
+
+def selected_by_selectors():
+    """hidden controls the finger selectors pick"""
+    return {skeleton.FK_CONTROL[j] for joints in skeleton.FINGER_SELECTORS.values() for j in joints}
 
 
 def _evaluate(node, name, frame):
@@ -304,48 +341,11 @@ def pose_from_geometry(geo):
     points = np.array(geo.pointFloatAttribValues("P")).reshape(-1, 3)
     positions = points[index]
     for upper, mid, tip in _LIMB_INDICES:
-        _solve_limb(world, positions, upper, mid, tip)
+        skeleton.solve_limb(world, positions, upper, mid, tip)
     local = world.copy()
     local[1:] = np.einsum("jba,jbc->jac", world[_PARENTS[1:]], world[1:])
     root_2d = points[names.index(skeleton.ROOT)][[0, 2]] if skeleton.ROOT in names else None
     return constraints.Pose(local, positions[0], root_2d)
 
 
-_REST = skeleton.rest_positions()
 _LIMB_INDICES = [tuple(skeleton.JOINT_NAMES.index(j) for j in limb) for limb in skeleton.LIMBS.values()]
-
-
-def _rotation_between(a, b):
-    v, c = np.cross(a, b), float(np.dot(a, b))
-    if c < -1.0 + 1e-12:
-        axis = np.cross(a, [1.0, 0.0, 0.0] if abs(a[0]) < 0.9 else [0.0, 1.0, 0.0])
-        axis /= np.linalg.norm(axis)
-        return 2.0 * np.outer(axis, axis) - np.eye(3)
-    k = np.array([[0.0, -v[2], v[1]], [v[2], 0.0, -v[0]], [-v[1], v[0], 0.0]])
-    return np.eye(3) + k + k @ k / (1.0 + c)
-
-
-def _solve_limb(world, positions, upper, mid, tip):
-    bone1, bone2 = _REST[mid] - _REST[upper], _REST[tip] - _REST[mid]
-    l1, l2 = np.linalg.norm(bone1), np.linalg.norm(bone2)
-    start, goal = positions[upper], positions[tip]
-    to_goal = goal - start
-    dist = np.linalg.norm(to_goal)
-    if dist < 1e-9:
-        return
-    axis = to_goal / dist
-    dist = min(max(dist, abs(l1 - l2) + 1e-9), l1 + l2)
-    along = (l1 * l1 - l2 * l2 + dist * dist) / (2.0 * dist)
-    out = np.sqrt(max(l1 * l1 - along * along, 0.0))
-    side = positions[mid] - start
-    side -= axis * np.dot(side, axis)
-    if np.linalg.norm(side) < 1e-9:
-        side = world[upper] @ bone1
-        side -= axis * np.dot(side, axis)
-    norm = np.linalg.norm(side)
-    side = side / norm if norm > 1e-9 else np.zeros(3)
-    middle = start + axis * along + side * out
-    end = start + axis * dist
-    world[upper] = _rotation_between(world[upper] @ bone1 / l1, (middle - start) / l1) @ world[upper]
-    world[mid] = _rotation_between(world[mid] @ bone2 / l2, (end - middle) / l2) @ world[mid]
-    positions[mid] = middle

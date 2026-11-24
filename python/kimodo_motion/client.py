@@ -15,7 +15,7 @@ import uuid
 HOST = "127.0.0.1"
 PORT = 44372
 SERVICE_NAME = "kimodo_motion"
-SERVICE_VERSION = 1
+SERVICE_VERSION = 2
 SESSION_ID = uuid.uuid4().hex
 _registered = set()
 
@@ -47,8 +47,11 @@ def text_encoder_device():
 
 def make_request(doc, constraints_json):
     """/generate body for a doc and its constraints json"""
+    from . import constraints
+
     g = doc["generation"]
-    return {
+    first = constraints.first_heading_angle(constraints_json)
+    return ({"first_heading_angle": first} if first is not None else {}) | {
         "model": doc["model"],
         "prompts": [{"text": p["text"], "num_frames": p["end_frame"] - p["start_frame"]} for p in doc["prompts"]],
         "constraints": constraints_json,
