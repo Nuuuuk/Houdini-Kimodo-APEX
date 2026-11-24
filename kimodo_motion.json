@@ -1,0 +1,8 @@
+{
+    "env": [
+        {"KIMODO_MOTION": "$HOUDINI_PACKAGE_PATH"},
+        {"PYTHONPATH": {"value": "$KIMODO_MOTION/python", "method": "append"}}
+    ],
+    "hpath": "$KIMODO_MOTION",
+    "enable": "houdini_version >= '22.0'"
+}
