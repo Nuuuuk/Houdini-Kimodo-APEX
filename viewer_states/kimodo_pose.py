@@ -105,6 +105,8 @@ def _missing():
         (asu, "HK_RADIAL_MENU"),
         (scu, "registerAnimateState"),
         (xformgadget, "registerXformHandle"),
+        (xformgadget, "SWITCH_ALIGN_MODE_SYMBOL"),
+        (asu.Hotkeys, "context"),
         (xgu, "isGlobalModeModifierMouseEvent"),
         (stateutils, "hudHotkeyRef"),
         (stateutils, "hotkeySymbolOrKeyString"),
@@ -130,6 +132,7 @@ def _missing():
 def _state_class():
     import apex.scene_2 as scene_2
     import apex.stateutils_2 as asu
+    import apex.xformgadget as xformgadget
     import apex.xformgadgetutils as xgu
     import apexanimate
     import stateutils as su
@@ -172,6 +175,13 @@ def _state_class():
                         {"id": "axissnapping", "label": "Enable axis snapping", "key": "Ctrl"},
                     ]
                     + apexanimate._buildHudGeneralRows(self.hotkeys)
+                    + [
+                        {
+                            "id": "alignment",
+                            "label": "Switch Local/World Alignment",
+                            "key": su.hudHotkeyRef(f"{self.hotkeys.context()}.{xformgadget.SWITCH_ALIGN_MODE_SYMBOL}"),
+                        },
+                    ]
                     + [
                         {
                             "type": "group",
