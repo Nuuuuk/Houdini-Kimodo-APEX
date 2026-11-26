@@ -4,7 +4,7 @@
 
 Describe an action in natural language, pose constraints on APEX, and [NVIDIA Kimodo](https://github.com/nv-tlabs/kimodo) generates the motion through them, locally on your GPU. It all lives in one node. Out comes a KineFX skeleton with Mixamo joint names.
 
-![](media/loop.webp)
+https://github.com/user-attachments/assets/2cacd05c-ef29-4dd0-83c9-cd70823e00a9
 
 ## Requirements
 
