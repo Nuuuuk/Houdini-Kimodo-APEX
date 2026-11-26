@@ -5,6 +5,7 @@ import ctypes
 import glob
 import hashlib
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -252,9 +253,9 @@ def disk_problem(needs, free=lambda path: shutil.disk_usage(path).free):
     for key, (path, size) in per_drive.items():
         if size and free(path) < size + GB:
             return (
-                f"Not enough free disk space on {key}: the install needs about {size / GB:.0f} GB there and "
-                f"{free(path) / GB:.0f} GB is free. Free some space, or move this folder to another drive, and "
-                f"run Install.bat again."
+                f"Not enough free disk space on {key}: the install needs about {math.ceil(size / GB + 1)} GB "
+                f"there and {math.floor(free(path) / GB)} GB is free. Free some space, or move this folder to "
+                f"another drive, and run Install.bat again."
             )
     return None
 
