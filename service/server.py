@@ -21,6 +21,18 @@ MODELS = ("Kimodo-SOMA-RP-v1.2", "Kimodo-SOMA-RP-v1.1", "Kimodo-SOMA-RP-v1")
 NUM_TRANSITION_FRAMES = 5
 
 
+def default_text_encoder_device():
+    """env KIMODO_TEXT_ENCODER_DEVICE, else settings.json, else cuda"""
+    value = os.environ.get("KIMODO_TEXT_ENCODER_DEVICE")
+    if value:
+        return value
+    try:
+        with open(os.path.join(ROOT, "settings.json"), encoding="utf-8") as f:
+            return json.load(f).get("text_encoder_device", "cuda")
+    except (OSError, ValueError, AttributeError):
+        return "cuda"
+
+
 def set_default_env():
     os.environ.setdefault("KIMODO_LLAMA_DIR", os.path.join(ROOT, "models", "Meta-Llama-3-8B-Instruct"))
     os.environ.setdefault("HF_HOME", os.path.join(ROOT, "models", "hf"))
@@ -430,9 +442,9 @@ def main():
     ap.add_argument(
         "--text-encoder-device",
         choices=("cuda", "cpu"),
-        default=os.environ.get("KIMODO_TEXT_ENCODER_DEVICE", "cuda"),
+        default=default_text_encoder_device(),
         help="cpu: run the text encoder on the CPU, for GPUs with less than ~16 GB "
-        "(default from env KIMODO_TEXT_ENCODER_DEVICE, else cuda)",
+        "(default from env KIMODO_TEXT_ENCODER_DEVICE, else settings.json, else cuda)",
     )
     ap.add_argument(
         "--idle-timeout",
