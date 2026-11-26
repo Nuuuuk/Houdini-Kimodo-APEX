@@ -36,6 +36,8 @@ def default_text_encoder_device():
 def set_default_env():
     os.environ.setdefault("KIMODO_LLAMA_DIR", os.path.join(ROOT, "models", "Meta-Llama-3-8B-Instruct"))
     os.environ.setdefault("HF_HOME", os.path.join(ROOT, "models", "hf"))
+    # everything is on disk after the install; without this loading asks the hub and fails offline
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
     os.environ.setdefault("LOCAL_CACHE", "true")
     os.environ.setdefault("TEXT_ENCODER_MODE", "local")
     # the fortran runtime scipy pulls in kills the process on console close otherwise
