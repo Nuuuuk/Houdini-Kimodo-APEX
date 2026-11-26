@@ -41,8 +41,16 @@ def service_port():
     return int(value)
 
 
-def text_encoder_device():
-    return os.environ.get("KIMODO_TEXT_ENCODER_DEVICE", "cuda")
+def text_encoder_device(root=None):
+    value = os.environ.get("KIMODO_TEXT_ENCODER_DEVICE")
+    if value:
+        return value
+    path = os.path.join(root or os.environ.get("KIMODO_MOTION", ""), "settings.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f).get("text_encoder_device", "cuda")
+    except (OSError, ValueError, AttributeError):
+        return "cuda"
 
 
 def make_request(doc, constraints_json):

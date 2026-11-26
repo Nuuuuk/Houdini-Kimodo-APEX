@@ -1,2 +1,3 @@
 *.hda binary
 *.whl binary
+*.bat text eol=crlf
