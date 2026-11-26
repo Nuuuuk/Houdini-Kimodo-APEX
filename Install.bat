@@ -39,7 +39,7 @@ certutil -hashfile ".deps\uv.zip" SHA256 | findstr /i /x "%UV_SHA256%" >nul || (
     del ".deps\uv.zip"
     goto :failed
 )
-tar.exe -xf ".deps\uv.zip" -C ".deps\uv" || goto :failed
+"%SystemRoot%\System32\tar.exe" -xf ".deps\uv.zip" -C ".deps\uv" || goto :failed
 del ".deps\uv.zip"
 
 :python
