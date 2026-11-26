@@ -45,7 +45,7 @@ del ".deps\uv.zip"
 :python
 if exist "%PY%" goto :install
 echo Python %PY_VERSION%
-"%UV%" python install %PY_VERSION% --no-bin --no-registry || goto :failed
+"%UV%" python install %PY_VERSION% --no-bin --no-registry -q || goto :failed
 
 :install
 "%PY%" -E -s -u -X utf8 install\install.py %* || goto :failed
