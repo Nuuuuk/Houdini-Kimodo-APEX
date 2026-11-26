@@ -129,7 +129,13 @@ def venv_env():
     """env for .venv's python, with the hf cache the service uses"""
     env = {k: v for k, v in os.environ.items() if not k.upper().startswith("PYTHON")}
     env.setdefault("HF_HOME", os.path.join(ROOT, "models", "hf"))
-    env.update(HF_HUB_DISABLE_TELEMETRY="1", HF_XET_CHUNK_CACHE_SIZE_BYTES="0", HF_HUB_VERBOSITY="error")
+    env.update(
+        # no telemetry, no xet chunk cache copy, no token or symlink nags
+        HF_HUB_DISABLE_TELEMETRY="1",
+        HF_XET_CHUNK_CACHE_SIZE_BYTES="0",
+        HF_HUB_VERBOSITY="error",
+        HF_HUB_DISABLE_SYMLINKS_WARNING="1",
+    )
     return env
 
 
@@ -269,7 +275,7 @@ def install_msvc_runtime():
     )
     exe = os.path.join(DEPS, "vc_redist.x64.exe")
     os.makedirs(DEPS, exist_ok=True)
-    subprocess.run(["curl.exe", "-fL", "--retry", "3", "-o", exe, VC_REDIST_URL], check=True)
+    subprocess.run(["curl.exe", "-fL", "-#", "--retry", "3", "-o", exe, VC_REDIST_URL], check=True)
     quoted = exe.replace("'", "''")
     check = (
         f"$s = Get-AuthenticodeSignature -LiteralPath '{quoted}'; if ($s.Status -eq 'Valid' -and "
@@ -297,7 +303,6 @@ def check_torch_cuda(gpu):
             f"{gpu['driver']}) is too old for CUDA 12.8. Install the latest driver from {DRIVER_URL}, restart "
             f"the computer, and run Install.bat again."
         )
-    print(f"PyTorch uses the GPU: {gpu['name']}")
 
 
 def venv_action(venv, state, lock_hash):
@@ -310,19 +315,15 @@ def venv_action(venv, state, lock_hash):
 
 
 def make_venv(action, lock_hash):
-    if action == "done":
-        print("Service environment (.venv): up to date.")
-        return
-    if action == "foreign":
-        print("Service environment: using the existing .venv, which the installer did not make, as it is.")
+    if action in ("done", "foreign"):
         return
     if not os.path.isfile(UV):
         sys.exit(f"uv not found at {UV}; run Install.bat.")
-    print("Service environment (.venv): installing the Python packages, about 3.5 GB to download ...", flush=True)
+    print("Python packages (3.5 GB)", flush=True)
     write_text(VENV_STATE, "pending")
     if action == "make":
         subprocess.run(
-            [UV, "venv", VENV, "--python", sys.executable, "--allow-existing", "--no-project"],
+            [UV, "venv", VENV, "--python", sys.executable, "--allow-existing", "--no-project", "-q"],
             cwd=ROOT,
             env=uv_env(),
             check=True,
@@ -332,8 +333,7 @@ def make_venv(action, lock_hash):
     )
     write_text(VENV_STATE, lock_hash)
     # the cache hard links all of .venv and explorer counts it twice, so drop it once installed
-    subprocess.run([UV, "cache", "clean"], cwd=ROOT, env=uv_env())
-    print("Service environment (.venv): installed.")
+    subprocess.run([UV, "cache", "clean", "-q"], cwd=ROOT, env=uv_env())
 
 
 def llama_dir():
@@ -360,11 +360,7 @@ def models_cached():
 
 def download_llama(path):
     """curl each file into .part, resuming, then rename it"""
-    print(
-        f"Meta-Llama-3-8B-Instruct: downloading {LLAMA_BYTES / GB:.0f} GB from {LLAMA_REPO} on Hugging Face "
-        f"into {path} ...",
-        flush=True,
-    )
+    print(f"Meta-Llama-3-8B-Instruct ({LLAMA_BYTES / GB:.0f} GB)", flush=True)
     os.makedirs(path, exist_ok=True)
     for name in LLAMA_FILES:
         target, size = os.path.join(path, name), LLAMA_SHARDS.get(name)
@@ -372,19 +368,17 @@ def download_llama(path):
             continue
         part = target + ".part"
         if size is None or not os.path.isfile(part) or os.path.getsize(part) != size:
-            print(name + (f" ({size / GB:.1f} GB)" if size else ""), flush=True)
             url = f"https://huggingface.co/{LLAMA_REPO}/resolve/{LLAMA_REVISION}/{name}"
-            resume = ["-C", "-"] if size else []
-            subprocess.run(["curl.exe", "-fL", "--retry", "5", "--retry-delay", "5", *resume, "-o", part, url], check=True)
+            # shards resume and show a bar, the small files come whole and quiet
+            how = ["-#", "-C", "-"] if size else ["-sS"]
+            subprocess.run(["curl.exe", "-fL", "--retry", "5", "--retry-delay", "5", *how, "-o", part, url], check=True)
         if size is not None and os.path.getsize(part) != size:
             sys.exit(f"{name} has {os.path.getsize(part)} bytes instead of {size}; run Install.bat again.")
         os.replace(part, target)
 
 
 def fetch_models(llama, have_llama):
-    if have_llama:
-        print(f"Meta-Llama-3-8B-Instruct: using the copy in {llama}")
-    else:
+    if not have_llama:
         download_llama(llama)
         if not llama_present(llama):
             sys.exit(f"Meta-Llama-3-8B-Instruct in {llama} is still incomplete; run Install.bat again.")
@@ -415,16 +409,13 @@ def write_pointer(pref_dir):
             old = f.read()
         try:
             if json.loads(old) == content:
-                print(f"package pointer already up to date: {path}")
                 return path
         except json.JSONDecodeError:
             pass
-        print(f"replacing package pointer {path} (was: {old.strip()})")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(content, f)
         f.write("\n")
-    print(f"wrote package pointer {path} -> {ROOT}")
     return path
 
 
@@ -496,12 +487,6 @@ def main():
     )
     if problem:
         sys.exit(problem)
-    print(f"GPU: {gpu['name']}, {gpu['vram_mib'] / 1024:.0f} GB, driver {gpu['driver']}")
-    if device == "cpu":
-        print(
-            "The GPU has under 16 GB of memory, so Kimodo's text encoder will run on the CPU (settings.json). It "
-            "uses about 16 GB of RAM, and each new prompt takes about 2 s longer to encode."
-        )
     if not msvc_runtime_present():
         install_msvc_runtime()
 
@@ -510,9 +495,7 @@ def main():
     fetch_models(llama, have_llama)
     write_settings(device)
 
-    pref_dir = houdini_prefs(hython)
-    print(f"Houdini user prefs: {pref_dir}")
-    write_pointer(pref_dir)
+    write_pointer(houdini_prefs(hython))
 
     check = (
         "import hou, json; t = hou.sopNodeTypeCategory().nodeTypes().get('kimodo_motion'); "
@@ -522,17 +505,14 @@ def main():
     ok = kimodo_motion is not None and os.path.normcase(os.path.abspath(kimodo_motion)) == os.path.normcase(
         os.path.abspath(ROOT)
     )
-    print(f"check: KIMODO_MOTION = {kimodo_motion}, Kimodo Motion SOP available: {has_sop}")
     if not (ok and has_sop):
-        sys.exit("Houdini did not load the package; see README.md, Troubleshooting")
-    print("kimodo_motion package installed.")
+        sys.exit(
+            f"Houdini did not load the package (KIMODO_MOTION = {kimodo_motion}, Kimodo Motion SOP: {has_sop}); "
+            "see README.md, Troubleshooting"
+        )
     print()
-    print(
-        "Kimodo Motion is installed. Start Houdini (close and start it again if it is open), and in a SOP network "
-        "press Tab > Kimodo > Kimodo Motion."
-    )
+    print("Kimodo Motion is installed.")
     print(f"Using it means agreeing to the Meta Llama 3 Community License: {LLAMA_LICENSE}")
-    print("Keep this folder where it is: Houdini loads the tool from here. To remove the tool, run Uninstall.bat.")
 
 
 if __name__ == "__main__":

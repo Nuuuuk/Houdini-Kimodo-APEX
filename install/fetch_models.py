@@ -14,7 +14,7 @@ def main():
         # hf_hub starts a cut-off file over, so drop what an interrupted run left
         for left in glob.glob(os.path.join(hub, "models--" + repo.replace("/", "--"), "blobs", "*.incomplete")):
             os.remove(left)
-    print("LLM2Vec adapters and the Kimodo checkpoint (1.5 GB the first time) ...", flush=True)
+    print("Kimodo model and the text encoder's adapters (1.5 GB)", flush=True)
     for repo, files in install.ADAPTERS.items():
         for name in files:
             hf_hub_download(repo, name)
