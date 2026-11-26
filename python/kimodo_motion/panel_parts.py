@@ -265,9 +265,24 @@ class ClipFields(QtWidgets.QWidget):
             rows.addLayout(row)
         self.prompt.editingFinished.connect(self.commit_prompt)
         self.duration.editingFinished.connect(self.commit_duration)
+        for field in (self.prompt, self.duration):
+            field.installEventFilter(self)
         self.slider.valueChanged.connect(self.slid)
         self.slider.sliderReleased.connect(self.slide_ended)
         self.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed)
+
+    # a click anywhere else commits the field first, so generate gets what was typed
+    def eventFilter(self, obj, event):
+        kind = event.type()
+        if obj in (self.prompt, self.duration) and kind in (QtCore.QEvent.FocusIn, QtCore.QEvent.FocusOut):
+            app = QtWidgets.QApplication.instance()
+            app.installEventFilter(self) if kind == QtCore.QEvent.FocusIn else app.removeEventFilter(self)
+        elif kind == QtCore.QEvent.MouseButtonPress and isinstance(obj, QtWidgets.QWidget):
+            for field, commit in ((self.prompt, self.commit_prompt), (self.duration, self.commit_duration)):
+                if field.hasFocus() and obj is not field and not field.isAncestorOf(obj):
+                    commit()
+                    field.clearFocus()
+        return super().eventFilter(obj, event)
 
     def place(self, left):
         label = max(left - self.LABEL_X - 4, 10)
