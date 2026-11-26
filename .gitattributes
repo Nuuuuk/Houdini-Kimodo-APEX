@@ -1,3 +1,4 @@
 *.hda binary
 *.whl binary
 *.bat text eol=crlf
+media/ export-ignore
