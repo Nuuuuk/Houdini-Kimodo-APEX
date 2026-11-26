@@ -27,6 +27,7 @@ NEEDED_METHODS = (
     "onKeyTransitEvent",
     "onMouseEvent",
     "_frameSelectedControls",
+    "getControlSelectors",
     "writeToSopNode",
     "runSceneCallbacks",
     "_showControlsCmd",
@@ -50,8 +51,11 @@ NEEDED_ATTRIBUTES = (
             "scene",
             "scene_callbacks",
             "control_selection",
+            "sel_handlers",
         ),
     ),
+    ("apex.scene_2", "SceneOutputDrawable", ("img_drawable",)),
+    ("apex.selectionhandler_2", "DrawableSelector", ("drawables", "drawable_classes")),
     ("apex.ui.settingshudwidgets", "AnimateSettingsWidget", ("widgethotkey", "hud_window")),
     ("apex.ui.splitchannelwidget", "SplitChannelWidgetHandler", ("widgethotkey", "hud_window", "is_visible")),
     ("apex.sceneevaluators", "SceneEvaluator", ("drawables",)),
@@ -191,6 +195,18 @@ def _state_class():
                     for verb in ("hide", "show")
                 }
             )
+
+        # no sprites in the selector: a box pick on the rig's empty sprite crashed houdini rendering the pick buffer
+        def getControlSelectors(self, set_visibility=True):
+            super().getControlSelectors(set_visibility)
+            sprites = {
+                id(d.img_drawable)
+                for cb in self.scene_callbacks.values()
+                for d in cb.drawables
+                if getattr(d, "img_drawable", None) is not None
+            }
+            selector = self.sel_handlers[-1]
+            selector.drawable_classes[0] = [d for d in selector.drawables if id(d) not in sprites]
 
         def _rig_skeletons(self):
             return [
