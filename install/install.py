@@ -319,7 +319,7 @@ def make_venv(action, lock_hash):
         return
     if not os.path.isfile(UV):
         sys.exit(f"uv not found at {UV}; run Install.bat.")
-    print("Python packages (3.5 GB)", flush=True)
+    print("Python packages (5 GB), this takes a few minutes", flush=True)
     write_text(VENV_STATE, "pending")
     if action == "make":
         subprocess.run(
@@ -329,7 +329,7 @@ def make_venv(action, lock_hash):
             check=True,
         )
     subprocess.run(
-        [UV, "pip", "sync", REQUIREMENTS, "--python", VENV_PYTHON, "--strict"], cwd=ROOT, env=uv_env(), check=True
+        [UV, "pip", "sync", REQUIREMENTS, "--python", VENV_PYTHON, "--strict", "-q"], cwd=ROOT, env=uv_env(), check=True
     )
     write_text(VENV_STATE, lock_hash)
     # the cache hard links all of .venv and explorer counts it twice, so drop it once installed
